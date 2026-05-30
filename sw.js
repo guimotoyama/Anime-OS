@@ -1,10 +1,10 @@
 const CACHE_NAME = 'anime-os-cache-v1';
 const ASSETS = [
-  '/',
-  '/index.html',
-  '/style.css',
-  '/script.js',
-  '/imagens/Logo.svg'
+  './',
+  './index.html',
+  './style.css',
+  './script.js',
+  './imagens/Logo.svg'
 ];
 
 self.addEventListener('install', (event) => {

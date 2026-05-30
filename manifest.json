@@ -1,7 +1,7 @@
 {
   "name": "Anime OS | GLM Anime",
   "short_name": "Anime OS",
-  "start_url": "index.html",
+  "start_url": "./index.html",
   "display": "standalone",
   "background_color": "#191919",
   "theme_color": "#CA3E47",
