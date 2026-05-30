@@ -1,0 +1,16 @@
+{
+  "name": "Anime OS | GLM Anime",
+  "short_name": "Anime OS",
+  "start_url": "index.html",
+  "display": "standalone",
+  "background_color": "#191919",
+  "theme_color": "#CA3E47",
+  "icons": [
+    {
+      "src": "imagens/Logo.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
