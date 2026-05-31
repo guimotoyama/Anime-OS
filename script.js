@@ -457,7 +457,10 @@ function renderDetail(anime) {
         <div class="detail-body">
             <div class="detail-info">
                 <h4>Sinopse</h4>
-                <p>${synopsis}</p>
+                <div class="synopsis-wrapper">
+                    <p id="synopsis-text" class="synopsis-text collapsed">${synopsis}</p>
+                    <button id="read-more-btn" class="read-more-btn">Ler mais</button>
+                </div>
                 
                 <h4>Gestão de Status</h4>
                 <div class="status-selector">
@@ -487,6 +490,17 @@ function renderDetail(anime) {
         </div>
     `;
     animeDetail.innerHTML = detailHTML;
+
+    // Read More Logic
+    const readMoreBtn = document.getElementById('read-more-btn');
+    const synopsisText = document.getElementById('synopsis-text');
+    if (readMoreBtn && synopsisText) {
+        readMoreBtn.onclick = () => {
+            const isCollapsed = synopsisText.classList.contains('collapsed');
+            synopsisText.classList.toggle('collapsed');
+            readMoreBtn.innerText = isCollapsed ? 'Ler menos' : 'Ler mais';
+        };
+    }
 
     const progressContent = document.getElementById('progress-content');
     const statusSelect = document.getElementById('status-select');

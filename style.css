@@ -24,21 +24,18 @@ body {
     color: var(--text-main);
     font-family: 'Inter', sans-serif;
     min-height: 100vh;
-}
-
-.app-container {
     max-width: 1200px;
     margin: 0 auto;
     padding: 60px 20px;
+ 
 }
 
 header {
+    width: 100%;
     display: flex;
     justify-content: space-between;
     align-items: center;
     margin-bottom: 60px;
-    gap: 20px;
-    flex-wrap: wrap;
 }
 
 .logo-area {
@@ -194,20 +191,18 @@ header {
     display: flex;
     gap: 20px;
     padding-bottom: 40px;
-    margin-bottom: 0;
+    margin: 0 auto 0 auto;
     justify-content: center;
     align-items: center;
     flex-wrap: wrap;
+    max-width: 1200px;
 }
 
-.filter-group {
+.filter-group, .sort-category-group {
     display: flex;
     gap: 12px;
-}
-
-.sort-category-group {
-    display: flex;
-    gap: 12px;
+    flex-wrap: wrap;
+    justify-content: center;
 }
 
 .premium-select {
@@ -529,6 +524,12 @@ header {
     box-shadow: 0 12px 25px rgba(202, 62, 71, 0.4);
 }
 
+#auth-submit:hover {
+    background: var(--accent-hover);
+    transform: translateY(-3px);
+    box-shadow: 0 12px 25px rgba(202, 62, 71, 0.4);
+}
+
 .auth-error {
     color: var(--danger);
     font-size: 0.85rem;
@@ -539,6 +540,7 @@ header {
 
 /* Overrides for Auth */
 .auth-overlay .app-container {
+
     display: none !important;
     background: var(--card-bg);
     border-radius: 24px;
@@ -550,6 +552,8 @@ header {
 .detail-header {
     height: 350px;
     position: relative;
+    border-radius: 24px;
+    overflow: hidden;
 }
 
 .detail-header img {
@@ -613,6 +617,32 @@ header {
     line-height: 1.8;
     margin-bottom: 25px;
     font-size: 1rem;
+}
+
+.synopsis-text.collapsed {
+    display: -webkit-box;
+    -webkit-line-clamp: 10;
+    line-clamp: 10;
+    -webkit-box-orient: vertical;
+    overflow: hidden !important;
+}
+
+.read-more-btn {
+    background: none;
+    border: none;
+    color: var(--accent-color);
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.9rem;
+    padding: 0;
+    margin-bottom: 25px;
+    font-family: inherit;
+    transition: var(--transition);
+}
+
+.read-more-btn:hover {
+    text-decoration: underline;
+    filter: brightness(1.2);
 }
 
 .detail-stats {
@@ -755,4 +785,84 @@ header {
     color: var(--success);
     font-weight: 600;
     animation: fadeIn 0.5s ease;
+}
+
+@media (max-width: 470px) {
+    .auth-card {
+        width: 80%;
+        padding: 25px;
+    }
+
+    header {
+        flex-direction: column;
+        justify-content: center;
+        gap: 60px;
+    }
+    .logo-area {
+        align-items: center !important;
+    }
+    .logo-img {
+        margin-bottom: 6px;
+    }
+    .logo-area p {
+        margin-left: 0 !important;
+    }
+    .search-box {
+        width: 96%;
+        justify-content: center;
+    }
+    .search-box input {
+        width: 65%;
+    }
+    #anime-search {
+        font-size: 11px;
+    }
+    .filters {
+        gap: 25px;
+    }
+
+    .filter-group, .sort-category-group {
+        flex-wrap: nowrap;
+        gap: 8px;
+    }
+    .filter-btn {
+        font-size: 0.8rem;
+    }
+    .premium-select {
+        font-size: 0.8rem;
+    }
+    .anime-grid {
+        grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+        gap: 15px;
+        padding: 0 15px;
+    }
+    .anime-card img {
+        height: 180px;
+        background: var(--bg-color);
+    }
+    .card-info {
+        padding: 10px;
+    }
+    .card-info h3 {
+        font-size: 1rem;
+    }
+    .status-badge {
+        font-size: 0.6rem;
+    }
+    .detail-overlay {
+        padding: 10px;
+    }
+    .detail-overlay h2 {
+        font-size: 1.7rem;
+    }
+    .synopsis-text.collapsed {
+    -webkit-line-clamp: 5 !important;
+    line-clamp: 5 !important;
+    }
+    .stat-label{
+        font-size: 0.8rem;
+    }
+    .stat-item {
+        font-size: 0.68rem;
+    }
 }
