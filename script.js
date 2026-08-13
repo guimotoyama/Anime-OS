@@ -45,6 +45,77 @@ function cleanDescription(desc) {
     return desc ? desc.replace(/<[^>]*>?/gm, '') : null;
 }
 
+function splitTextForTranslation(text, maxLen = 1500) {
+    if (text.length <= maxLen) return [text];
+    const sentences = text.match(/[^.!?]+[.!?]+|\S+$/g) || [text];
+    const chunks = [];
+    let current = '';
+    for (const sentence of sentences) {
+        if ((current + sentence).length > maxLen) {
+            if (current) chunks.push(current);
+            current = sentence;
+        } else {
+            current += sentence;
+        }
+    }
+    if (current) chunks.push(current);
+    return chunks;
+}
+
+async function migrateOldSynopses() {
+    const { data, error } = await supabaseClient
+        .from('animes')
+        .select('id, title, synopsis, synopsis_lang')
+        .not('synopsis', 'is', null)
+        .neq('synopsis_lang', 'pt');
+
+    if (error) { console.error('Erro ao buscar animes para migração:', error); return; }
+    if (!data || data.length === 0) { console.log('Nada para traduzir. Todos já estão em PT-BR.'); return; }
+
+    console.log(`Iniciando tradução de ${data.length} anime(s)...`);
+    let sucesso = 0, falha = 0;
+
+    for (const anime of data) {
+        try {
+            const translated = await translateToPtBr(anime.synopsis);
+            await supabaseClient
+                .from('animes')
+                .update({ synopsis: translated, synopsis_lang: 'pt' })
+                .eq('id', anime.id);
+            console.log(`✅ Traduzido: ${anime.title}`);
+            sucesso++;
+        } catch (e) {
+            console.warn(`❌ Falhou: ${anime.title}`, e.message);
+            falha++;
+        }
+        await new Promise(r => setTimeout(r, 500)); // evita sobrecarregar o serviço gratuito
+    }
+
+    console.log(`Migração concluída. Sucesso: ${sucesso} | Falhas: ${falha}`);
+    await loadList();
+    renderGrid(document.querySelector('.filter-btn.active').dataset.filter, '');
+}
+
+async function translateToPtBr(text) {
+    if (!text) return text;
+    try {
+        const chunks = splitTextForTranslation(text);
+        const translatedParts = [];
+        for (const chunk of chunks) {
+            const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=pt&dt=t&q=${encodeURIComponent(chunk)}`;
+            const resp = await fetch(url);
+            if (!resp.ok) throw new Error(`Tradução falhou: ${resp.status}`);
+            const data = await resp.json();
+            const translated = data[0].map(part => part[0]).join('');
+            translatedParts.push(translated);
+        }
+        return translatedParts.join(' ');
+    } catch (e) {
+        console.warn('Falha ao traduzir, mantendo texto original em inglês:', e.message);
+        return text;
+    }
+}
+
 const authContainer = document.getElementById('auth-container');
 const loginForm = document.getElementById('login-form');
 const authEmail = document.getElementById('auth-email');
@@ -139,7 +210,8 @@ async function addAnimeToDB(anime) {
         cover_url: anime.cover_url,
         year: anime.year,
         genres: anime.genres || [],
-        synopsis: anime.synopsis || null
+        synopsis: anime.synopsis || null,
+        synopsis_lang: anime.synopsis_lang || 'pt'
     }]);
     if (error) console.error('Erro ao adicionar anime:', error);
 }
@@ -226,6 +298,9 @@ function showStatusPicker() {
 async function finalizeAdd(status) {
     const anime = currentSelectedAnime;
     const totalEp = anime.episodes || 0;
+    const rawSynopsis = cleanDescription(anime.description);
+    const translatedSynopsis = await translateToPtBr(rawSynopsis);
+
     const newAnime = {
         mal_id: anime.id,
         title: getBestTitle(anime.title),
@@ -234,7 +309,8 @@ async function finalizeAdd(status) {
         total_ep: totalEp,
         status: status,
         current_ep: status === 'completed' ? totalEp : 0,
-        synopsis: cleanDescription(anime.description),
+        synopsis: translatedSynopsis,
+        synopsis_lang: 'pt',
         genres: anime.genres || [],
     };
     await addAnimeToDB(newAnime);
@@ -346,13 +422,18 @@ async function showDetail(id_db) {
         const m = data?.Media;
         if (!m) throw new Error('Anime não encontrado na AniList.');
 
+        const rawSynopsis = cleanDescription(m.description);
+        const translatedSynopsis = await translateToPtBr(rawSynopsis);
+
         const updatedFields = {
-            synopsis: cleanDescription(m.description),
-            genres: m.genres || [],
-            total_ep: m.episodes || 0,
-            year: m.seasonYear || null,
-            cover_url: anime.cover_url || m.coverImage?.large
+         synopsis: translatedSynopsis,
+         synopsis_lang: 'pt',
+         genres: m.genres || [],
+         total_ep: m.episodes || 0,
+         year: m.seasonYear || null,
+         cover_url: anime.cover_url || m.coverImage?.large
         };
+
         await updateAnimeFields(id_db, updatedFields);
         Object.assign(anime, updatedFields);
         UI.hideModal();
