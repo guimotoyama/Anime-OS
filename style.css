@@ -297,6 +297,16 @@ header {
     font-weight: 600;
 }
 
+.ep-completed {
+    color: var(--success);
+    font-weight: 600;
+}
+
+.ep-planned {
+    color: var(--text-dim);
+    font-weight: 600;
+}
+
 .status-badge {
     position: absolute;
     top: 15px;

@@ -1,4 +1,4 @@
-const API_URL = 'https://api.jikan.moe/v4';
+const API_URL = 'https://graphql.anilist.co';
 const SUPABASE_URL = 'https://pebpxvymmoqlezsqewyt.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_OEMXXgntsFTGS-N-Ve9ZCg_QAf8GM2W';
 
@@ -8,17 +8,50 @@ let myAnimeList = [];
 let currentSelectedAnime = null;
 let searchTimeout = null;
 
-// ---------- DOM ELEMENTS ----------
+async function queryAniList(query, variables = {}, retries = 2) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+    try {
+        const response = await fetch(API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({ query, variables }),
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        if ((response.status === 429 || response.status >= 500) && retries > 0) {
+            await new Promise(r => setTimeout(r, 800));
+            return queryAniList(query, variables, retries - 1);
+        }
+        if (!response.ok) throw new Error(`Erro na AniList: ${response.status}`);
+
+        const json = await response.json();
+        if (json.errors) throw new Error(json.errors[0].message);
+        return json.data;
+    } catch (e) {
+        clearTimeout(timeoutId);
+        if (e.name === 'AbortError') throw new Error('A busca demorou demais para responder. Tente novamente.');
+        throw e;
+    }
+}
+
+function getBestTitle(titleObj) {
+    if (!titleObj) return 'Título Indisponível';
+    return titleObj.english || titleObj.romaji || titleObj.native || 'Título Indisponível';
+}
+
+function cleanDescription(desc) {
+    return desc ? desc.replace(/<[^>]*>?/gm, '') : null;
+}
+
 const authContainer = document.getElementById('auth-container');
-const appContainer = document.querySelector('.app-container');
 const loginForm = document.getElementById('login-form');
 const authEmail = document.getElementById('auth-email');
 const authPassword = document.getElementById('auth-password');
 const authSubmit = document.getElementById('auth-submit');
 const authError = document.getElementById('auth-error');
-
 const searchInput = document.getElementById('anime-search');
-
 const searchBtn = document.getElementById('search-btn');
 const clearBtn = document.getElementById('clear-search');
 const animeGrid = document.getElementById('anime-grid');
@@ -33,34 +66,18 @@ const modalFooter = document.getElementById('modal-footer');
 const closeModal = document.getElementById('modal-close-x');
 const searchResults = document.getElementById('search-results');
 
-// ---------- AUTH LOGIC ----------
-
-async function toggleAuthUI(isLoggedIn) {
-    if (isLoggedIn) {
-        authContainer.style.display = 'none';
-        appContainer.style.display = 'block';
-    } else {
-        authContainer.style.display = 'flex';
-        appContainer.style.display = 'none';
-    }
+function toggleAuthUI(isLoggedIn) {
+    authContainer.style.display = isLoggedIn ? 'none' : 'flex';
 }
 
 async function checkUserSession() {
     const { data: { session }, error } = await supabaseClient.auth.getSession();
-    if (error) {
-        console.error('Session check error:', error);
+    if (error || !session) {
         toggleAuthUI(false);
         return false;
     }
-    
-    if (session) {
-        console.log('User session found. Welcome back!');
-        toggleAuthUI(true);
-        return true;
-    }
-    
-    toggleAuthUI(false);
-    return false;
+    toggleAuthUI(true);
+    return true;
 }
 
 async function handleLogin(e) {
@@ -68,31 +85,20 @@ async function handleLogin(e) {
     authError.innerText = '';
     authSubmit.innerText = 'Autenticando...';
     authSubmit.disabled = true;
-
     const email = authEmail.value.trim();
     const password = authPassword.value.trim();
-
     try {
-        const { data, error } = await supabaseClient.auth.signInWithPassword({
-            email: email,
-            password: password
-        });
-
+        const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
         if (error) throw error;
-
-        console.log('Login successful!');
-        await toggleAuthUI(true);
-        await initApp(); // Load data after login
+        toggleAuthUI(true);
+        await initApp();
     } catch (err) {
-        console.error('Login error:', err);
-        authError.innerText = err.message || 'Falha na autenticação. Verifique seus dados.';
+        authError.innerText = err.message || 'Falha na autenticação.';
     } finally {
         authSubmit.innerText = 'Entrar no Sistema';
         authSubmit.disabled = false;
     }
 }
-
-// ---------- UI HELPER ----------
 
 const UI = {
     showModal(title, contentHTML, buttons = []) {
@@ -113,328 +119,247 @@ const UI = {
     }
 };
 
-// ---------- DATABASE LOGIC ----------
-
 async function loadList() {
     const { data, error } = await supabaseClient
         .from('animes')
         .select('*')
         .order('created_at', { ascending: false });
-
-    if (error) {
-        console.error('Error loading anime list:', error);
-        return;
-    }
+    if (error) { console.error('Erro ao carregar lista:', error); return; }
     myAnimeList = data;
     updateGenreDropdown();
 }
 
-async function syncLocalStorage() {
-    const localDataRaw = localStorage.getItem('animeOS_list');
-    if (!localDataRaw) return;
-    
-    const localData = JSON.parse(localDataRaw);
-    if (!localData || localData.length === 0) return;
-
-    console.log('Found local data, migrating...');
-
-    const dbData = localData.map(anime => ({
-        mal_id: anime.id, 
+async function addAnimeToDB(anime) {
+    const { error } = await supabaseClient.from('animes').insert([{
+        mal_id: anime.mal_id,
         title: anime.title,
         status: anime.status,
-        current_ep: anime.currentEpisode || 0,
-        total_ep: anime.episodes === '?' ? 0 : parseInt(anime.episodes),
-        cover_url: anime.image,
-        year: anime.year === 'N/A' ? null : parseInt(anime.year),
-        synopsis: anime.fullInfo ? anime.fullInfo.synopsis : null,
-        genres: anime.fullInfo ? anime.fullInfo.genres.map(g => g.name) : [],
-        status_label: anime.statusLabel 
-    }));
-
-    const { error } = await supabaseClient.from('animes').insert(dbData);
-    if (!error) {
-        localStorage.removeItem('animeOS_list');
-        console.log('LocalStorage migrated to Supabase successfully!');
-        await loadList();
-    } else {
-        console.error('Migration error:', error);
-    }
+        current_ep: anime.current_ep || 0,
+        total_ep: anime.total_ep || 0,
+        cover_url: anime.cover_url,
+        year: anime.year,
+        genres: anime.genres || [],
+        synopsis: anime.synopsis || null
+    }]);
+    if (error) console.error('Erro ao adicionar anime:', error);
 }
 
-async function saveAnime(anime) {
-    const dbId = anime.id; 
-
-    if (dbId && typeof dbId === 'string' && dbId.length > 20) {
-        const { error } = await supabaseClient
-            .from('animes')
-            .update({
-                status: anime.status,
-                current_ep: anime.current_ep || anime.currentEpisode,
-                total_ep: anime.total_ep || (anime.episodes === '?' ? 0 : parseInt(anime.episodes))
-            })
-            .eq('id', dbId);
-        if (error) console.error('Update error:', error);
-    } else {
-        const { data, error } = await supabaseClient
-            .from('animes')
-            .insert([{
-                mal_id: anime.id || anime.mal_id,
-                title: anime.title,
-                status: anime.status,
-                current_ep: anime.current_ep || anime.currentEpisode || 0,
-                total_ep: anime.total_ep || (anime.episodes === '?' ? 0 : parseInt(anime.episodes)),
-                cover_url: anime.image || anime.cover_url,
-                year: anime.year === 'N/A' ? null : parseInt(anime.year),
-                genres: anime.fullInfo ? anime.fullInfo.genres.map(g => g.name) : (anime.genres || []),
-                synopsis: anime.fullInfo ? anime.// l's missing... just fixing in write
-                synopsis: anime.fullInfo ? anime.fullInfo.synopsis : (anime.synopsis || null)
-            }])
-            .select();
-        if (error) console.error('Insert error:', error);
-        else if (data) anime.id = data[0].id;
-    }
+async function updateAnimeFields(id, fields) {
+    const { error } = await supabaseClient.from('animes').update(fields).eq('id', id);
+    if (error) console.error('Erro ao atualizar anime:', error);
 }
 
 async function removeAnime(id_db) {
-    const { error } = await supabaseClient.from('animes').delete().eq('id', id_db);
-    if (error) console.error('Delete error:', error);
+    await supabaseClient.from('animes').delete().eq('id', id_db);
 }
 
-// ---------- CORE LOGIC ----------
+// ---------- BUSCA DE NOVOS ANIMES (AniList) ----------
 
 async function fetchSuggestions() {
     const query = searchInput.value.trim();
     if (query.length < 3) { searchResults.style.display = 'none'; return; }
-    try {
-        const resp = await fetch(`${API_URL}/anime?q=${encodeURIComponent(query)}&limit=20`);
-        const data = await resp.json();
-        if (data.data && data.data.length) {
-            renderSuggestions(data.data);
-        } else {
-            searchResults.style.display = 'none';
+
+    const gqlQuery = `
+        query ($search: String) {
+            Page(perPage: 15) {
+                media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
+                    id
+                    title { english romaji native }
+                    coverImage { large }
+                    seasonYear
+                    episodes
+                    genres
+                    description
+                }
+            }
         }
-    } catch (e) { console.error(e); searchResults.style.display = 'none'; }
+    `;
+    try {
+        const data = await queryAniList(gqlQuery, { search: query });
+        const animes = data?.Page?.media || [];
+        if (animes.length > 0) {
+            renderSuggestions(animes);
+        } else {
+            searchResults.innerHTML = '<div style="padding:15px;color:var(--text-dim);">Nenhum resultado encontrado.</div>';
+            searchResults.style.display = 'block';
+        }
+    } catch (e) {
+        console.warn('Busca falhou:', e.message);
+        searchResults.innerHTML = `<div style="padding:15px;color:var(--text-dim);">${e.message}</div>`;
+        searchResults.style.display = 'block';
+    }
 }
 
 function renderSuggestions(animes) {
     searchResults.innerHTML = '';
     searchResults.style.display = 'block';
     animes.forEach(anime => {
+        const title = getBestTitle(anime.title);
+        const imgUrl = anime.coverImage?.large || 'https://via.placeholder.com/40x60?text=No+Img';
         const item = document.createElement('div');
         item.className = 'result-item';
-        item.innerHTML = `<img src="${anime.images.jpg.image_url}" alt="${anime.title}"><span class="title">${anime.title}</span>`;
+        item.innerHTML = `<img src="${imgUrl}" alt="${title}"><span class="title">${title}</span>`;
         item.onclick = () => {
             currentSelectedAnime = anime;
             showStatusPicker();
             searchResults.style.display = 'none';
-            searchInput.value = anime.title;
         };
         searchResults.appendChild(item);
     });
 }
 
-async function searchAnime() {
-    const query = searchInput.value.trim();
-    if (!query) return;
-    searchBtn.innerText = '...';
-    try {
-        const resp = await fetch(`${API_URL}/anime?q=${encodeURIComponent(query)}&limit=1`);
-        const data = await resp.json();
-        if (data.data && data.data.length) {
-            const anime = data.data[0];
-            UI.showModal('Confirmar Adição', `
-                <div style="display:flex;gap:20px;align-items:center;">
-                    <img src="${anime.images.jpg.image_url}" style="width:100px;border-radius:8px;" />
-                    <div>
-                        <strong>${anime.title}</strong><br/>
-                        <small>Ano: ${anime.year || 'N/A'}</small><br/>
-                        <small>Episódios: ${anime.episodes || '?'}</small><br/>
-                        <small>Gêneros: ${anime.genres.map(g=>g.name).join(', ')}</small>
-                    </div>
-                </div>
-            `, [
-                {text:'Adicionar', class:'btn-confirm', action:()=>{currentSelectedAnime = anime; showStatusPicker();}},
-                {text:'Cancelar', class:'btn-cancel', action:UI.hideModal}
-            ]);
-        } else {
-            UI.showModal('Erro', 'Anime não encontrado no MAL.', [{text:'Ok', class:'btn-confirm', action:UI.hideModal}]);
-        }
-    } catch (e) {
-        UI.showModal('Erro', 'Problema ao conectar à API.', [{text:'Tentar novamente', class:'btn-confirm', action:searchAnime}]);
-    } finally { searchBtn.innerText = '🔍 Buscar'; }
-}
-
 function showStatusPicker() {
     const anime = currentSelectedAnime;
     UI.showModal('Definir Status', `
-        <p style="margin-bottom:15px;">Em qual categoria deseja adicionar <strong>${anime.title}</strong>?</p>
+        <p style="margin-bottom:15px;">Em qual categoria deseja adicionar <strong>${getBestTitle(anime.title)}</strong>?</p>
         <div style="display:grid;gap:10px;">
-            <button class="btn-modal btn-cancel status-opt" data-status="watching" data-label="Assistindo">🔵 Assistindo</button>
-            <button class="btn-modal btn-cancel status-opt" data-status="completed" data-label="Concluído">✅ Concluído</button>
-            <button class="btn-modal btn-cancel status-opt" data-status="planned" data-label="Planejado">⏳ Planejado</button>
+            <button class="btn-modal btn-cancel status-opt" data-status="watching">🔵 Assistindo</button>
+            <button class="btn-modal btn-cancel status-opt" data-status="completed">✅ Concluído</button>
+            <button class="btn-modal btn-cancel status-opt" data-status="planned">⏳ Planejado</button>
         </div>
     `, []);
     document.querySelectorAll('.status-opt').forEach(btn => {
-        btn.onclick = () => { finalizeAdd(btn.dataset.status, btn.dataset.label); };
+        btn.onclick = () => { finalizeAdd(btn.dataset.status); };
     });
 }
 
-async function finalizeAdd(status, label) {
+async function finalizeAdd(status) {
     const anime = currentSelectedAnime;
-    
-    // Mostrar loading no modal para o usuário saber que estamos buscando os detalhes completos
-    UI.showModal('Sincronizando...', 'Buscando detalhes completos no MAL para habilitar filtros...', []);
-
-    try {
-        // Buscar detalhes completos IMEDIATAMENTE no momento da adição
-        const resp = await fetch(`${API_URL}/anime/${anime.mal_id}/full`);
-        const data = await resp.json();
-        const fullInfo = data.data;
-
-        const newAnime = {
-            id: anime.mal_id,
-            title: anime.title,
-            image: anime.images.jpg.image_url,
-            year: fullInfo.year || anime.year || 'N/A',
-            episodes: fullInfo.episodes || anime.episodes || '?',
-            status: status,
-            statusLabel: label,
-            currentEpisode: 0,
-            currentSeason: 1,
-            // Já enviamos os detalhes completos para o Supabase
-            synopsis: fullInfo.synopsis,
-            genres: fullInfo.genres ? fullInfo.genres.map(g => g.name) : [],
-            fullInfo: fullInfo
-        };
-        
-        await saveAnime(newAnime);
-        await loadList();
-        
-        searchInput.value = '';
-        clearBtn.style.display = 'none';
-        UI.hideModal();
-        renderGrid(document.querySelector('.filter-btn.active').dataset.filter, searchInput.value.trim());
-    } catch (e) {
-        console.error('Erro ao buscar detalhes na adição:', e);
-        UI.hideModal();
-        // Fallback: adiciona mesmo sem detalhes completos para não travar o usuário
-        const fallbackAnime = {
-            id: anime.mal_id,
-            title: anime.title,
-            image: anime.images.jpg.image_url,
-            status: status,
-            statusLabel: label,
-            currentEpisode: 0
-        };
-        await saveAnime(fallbackAnime);
-        await loadList();
-        renderGrid(document.querySelector('.filter-btn.active').dataset.filter, searchInput.value.trim());
-    }
+    const totalEp = anime.episodes || 0;
+    const newAnime = {
+        mal_id: anime.id,
+        title: getBestTitle(anime.title),
+        cover_url: anime.coverImage?.large,
+        year: anime.seasonYear || null,
+        total_ep: totalEp,
+        status: status,
+        current_ep: status === 'completed' ? totalEp : 0,
+        synopsis: cleanDescription(anime.description),
+        genres: anime.genres || [],
+    };
+    await addAnimeToDB(newAnime);
+    await loadList();
+    searchInput.value = '';
+    clearBtn.style.display = 'none';
+    UI.hideModal();
+    renderGrid(document.querySelector('.filter-btn.active').dataset.filter, '');
 }
 
-async function renderGrid(filter = 'watching', searchTerm = '') {
-    await loadList();
+// ---------- GRID PRINCIPAL ----------
+
+function renderGrid(filter, query = '') {
+    let list = myAnimeList.filter(a => a.status === filter);
+
+    if (query) {
+        const q = query.toLowerCase();
+        list = list.filter(a => a.title.toLowerCase().includes(q));
+    }
+
+    const genreVal = genreSelect.value;
+    if (genreVal && genreVal !== 'all') {
+        list = list.filter(a => a.genres && a.genres.includes(genreVal));
+    }
+
+    const sortVal = sortSelect.value;
+    if (sortVal === 'alpha') {
+        list = [...list].sort((a, b) => a.title.localeCompare(b.title));
+    } else {
+        list = [...list].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    }
+
     animeGrid.innerHTML = '';
-    
-    let filtered = filter === 'all' ? [...myAnimeList] : myAnimeList.filter(a => a.status === filter);
-    
-    // Category Filter
-    const selectedGenre = genreSelect.value;
-    if (selectedGenre !== 'all') {
-        filtered = filtered.filter(a => a.genres && a.genres.includes(selectedGenre));
+
+    if (list.length === 0) {
+        animeGrid.innerHTML = `<p style="color:var(--text-dim);grid-column:1/-1;text-align:center;padding:40px 0;">Nenhum anime encontrado.</p>`;
+        return;
     }
 
-    // Search Term Filter
-    if (searchTerm) {
-        filtered = filtered.filter(a => a.title.toLowerCase().includes(searchTerm.toLowerCase()));
-    }
+    list.forEach(anime => {
+        const badgeClass = anime.status === 'watching' ? 'badge-watching'
+            : anime.status === 'completed' ? 'badge-completed' : 'badge-planned';
+        const badgeLabel = anime.status === 'watching' ? 'Assistindo'
+            : anime.status === 'completed' ? 'Concluído' : 'Planejado';
 
-    // Sorting
-    const sortType = sortSelect.value;
-    if (sortType === 'alpha') {
-        filtered.sort((a, b) => a.title.localeCompare(b.title));
-    } else if (sortType === 'recent') {
-        // Supabase already returns ordered by created_at desc
-    }
-
-    filtered.forEach((anime) => {
-        const card = document.createElement('div');
-        card.className = 'anime-card';
-        card.dataset.id = anime.id;
-        
-        let metaContent = `<span>${anime.year}</span>`;
+        let metaRight;
         if (anime.status === 'watching') {
-            metaContent += `<span class="current-ep">Ep ${anime.current_ep}/${anime.total_ep}</span>`;
+            metaRight = `<span class="current-ep">Ep ${anime.current_ep || 0}/${anime.total_ep || '?'}</span>`;
+        } else if (anime.status === 'completed') {
+            metaRight = `<span class="ep-completed">${anime.total_ep || '?'} Episódios</span>`;
         } else {
-            metaContent += `<span>${anime.total_ep} eps</span>`;
+            metaRight = `<span class="ep-planned">${anime.total_ep || '?'} Episódios</span>`;
         }
 
+        const card = document.createElement('div');
+        card.className = 'anime-card';
         card.innerHTML = `
-            <button class="delete-btn" onclick="deleteAnime('${anime.id}')">×</button>
-            <span class="status-badge badge-${anime.status}">
-                ${anime.status === 'watching' ? 'Assistindo' : anime.status === 'completed' ? 'Concluído' : 'Planejado'}
-            </span>
-            <img src="${anime.cover_url}" alt="${anime.title}">
+            <span class="status-badge ${badgeClass}">${badgeLabel}</span>
+            <button class="delete-btn" title="Remover">&times;</button>
+            <img src="${anime.cover_url || ''}" alt="${anime.title}" loading="lazy">
             <div class="card-info">
                 <h3>${anime.title}</h3>
-                <div class="card-meta">${metaContent}</div>
+                <div class="card-meta">
+                    <span class="meta-year">${anime.year || 'N/A'}</span>
+                    ${metaRight}
+                </div>
             </div>
         `;
-        card.addEventListener('click', e => {
-            if (e.target.closest('.delete-btn')) return;
-            showDetail(anime.id);
+        card.querySelector('.delete-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            deleteAnime(anime.id);
         });
+        card.addEventListener('click', () => showDetail(anime.id));
         animeGrid.appendChild(card);
     });
 }
 
-async function deleteAnime(id_db) {
-    const anime = myAnimeList.find(a => a.id === id_db);
-    if (!anime) return;
-    UI.showModal('Remover Anime', `Tem certeza que deseja remover <strong>${anime.title}</strong>?`, [
-        {text:'Sim, remover', class:'btn-confirm', action:async()=>{
-            await removeAnime(id_db);
-            await loadList();
-            renderGrid(document.querySelector('.filter-btn.active').dataset.filter, searchInput.value.trim()); 
-            UI.hideModal();
-        }},
-        {text:'Cancelar', class:'btn-cancel', action:UI.hideModal}
-    ]);
-}
+// ---------- TELA DE DETALHES ----------
 
 async function showDetail(id_db) {
     const anime = myAnimeList.find(a => a.id === id_db);
     if (!anime) return;
-    
     animeGrid.style.display = 'none';
     animeDetail.style.display = 'block';
     animeDetail.innerHTML = '';
-    
+
     if (anime.synopsis) {
         renderDetail(anime);
-    } else {
-        UI.showModal('Carregando', 'Buscando detalhes...', []);
-        try {
-            const resp = await fetch(`${API_URL}/anime/${anime.mal_id}/full`);
-            const data = await resp.json();
-            UI.hideModal();
-            
-            await supabaseClient.from('animes').update({
-                synopsis: data.data.synopsis,
-                genres: data.data.genres.map(g => g.name),
-                total_ep: data.data.episodes || 0
-            }).eq('id', id_db);
-            
-            anime.synopsis = data.data.synopsis;
-            anime.genres = data.data.genres.map(g => g.name);
-            anime.total_ep = data.data.episodes || 0;
-            
-            renderDetail(anime);
-        } catch (err) {
-            UI.hideModal();
-            console.error(err);
-            UI.showModal('Erro', 'Falha ao obter detalhes.', [{text:'Ok', class:'btn-confirm', action:UI.hideModal}]);
-        }
+        return;
+    }
+
+    UI.showModal('Carregando', 'Buscando detalhes...', []);
+    try {
+        const anilistId = parseInt(anime.mal_id);
+        if (isNaN(anilistId)) throw new Error('ID do anime inválido.');
+
+        const gqlQuery = `
+            query ($id: Int) {
+                Media(id: $id, type: ANIME) {
+                    description
+                    genres
+                    episodes
+                    seasonYear
+                    coverImage { large }
+                }
+            }
+        `;
+        const data = await queryAniList(gqlQuery, { id: anilistId });
+        const m = data?.Media;
+        if (!m) throw new Error('Anime não encontrado na AniList.');
+
+        const updatedFields = {
+            synopsis: cleanDescription(m.description),
+            genres: m.genres || [],
+            total_ep: m.episodes || 0,
+            year: m.seasonYear || null,
+            cover_url: anime.cover_url || m.coverImage?.large
+        };
+        await updateAnimeFields(id_db, updatedFields);
+        Object.assign(anime, updatedFields);
+        UI.hideModal();
+        renderDetail(anime);
+    } catch (err) {
+        UI.hideModal();
+        UI.showModal('Erro', err.message || 'Falha ao obter detalhes.', [{ text: 'Ok', class: 'btn-confirm', action: UI.hideModal }]);
     }
 }
 
@@ -446,7 +371,7 @@ function renderDetail(anime) {
     const genres = anime.genres ? anime.genres.join(', ') : '';
     const image = anime.cover_url;
 
-    const detailHTML = `
+    animeDetail.innerHTML = `
         <div class="detail-header">
             <img src="${image}" alt="${anime.title}">
             <div class="detail-overlay">
@@ -461,7 +386,6 @@ function renderDetail(anime) {
                     <p id="synopsis-text" class="synopsis-text collapsed">${synopsis}</p>
                     <button id="read-more-btn" class="read-more-btn">Ler mais</button>
                 </div>
-                
                 <h4>Gestão de Status</h4>
                 <div class="status-selector">
                     <label>Status Atual:</label>
@@ -471,14 +395,12 @@ function renderDetail(anime) {
                         <option value="planned" ${anime.status === 'planned' ? 'selected' : ''}>⏳ Planejado</option>
                     </select>
                 </div>
-
                 <h4>Informações</h4>
                 <div class="detail-stats">
                     <div class="stat-item"><span class="stat-label">Ano</span><span class="stat-value">${year}</span></div>
                     <div class="stat-item"><span class="stat-label">Episódios</span><span class="stat-value">${episodesStr}</span></div>
                     <div class="stat-item"><span class="stat-label">Gêneros</span><span class="stat-value">${genres}</span></div>
                 </div>
-
                 <div class="progress-tracker" id="progress-tracker">
                     <div id="progress-content"></div>
                 </div>
@@ -489,9 +411,7 @@ function renderDetail(anime) {
             <div class="detail-sidebar"></div>
         </div>
     `;
-    animeDetail.innerHTML = detailHTML;
 
-    // Read More Logic
     const readMoreBtn = document.getElementById('read-more-btn');
     const synopsisText = document.getElementById('synopsis-text');
     if (readMoreBtn && synopsisText) {
@@ -505,7 +425,7 @@ function renderDetail(anime) {
     const progressContent = document.getElementById('progress-content');
     const statusSelect = document.getElementById('status-select');
 
-    const updateUI = async () => {
+    const updateUI = () => {
         const currentEp = anime.current_ep;
         const percent = !isNaN(totalEps) ? Math.min(Math.max((currentEp / totalEps) * 100, 0), 100) : 0;
 
@@ -527,17 +447,16 @@ function renderDetail(anime) {
                     <button class="prog-btn" id="inc-ep">+</button>
                 </div>
             `;
-            
-            document.getElementById('inc-ep').onclick = async () => { 
+            document.getElementById('inc-ep').onclick = async () => {
                 anime.current_ep = (typeof anime.current_ep === 'number') ? anime.current_ep + 1 : 1;
-                await saveAnime(anime);
-                updateUI(); 
+                await updateAnimeFields(anime.id, { current_ep: anime.current_ep });
+                updateUI();
             };
-            document.getElementById('dec-ep').onclick = async () => { 
+            document.getElementById('dec-ep').onclick = async () => {
                 if (typeof anime.current_ep === 'number' && anime.current_ep > 0) {
                     anime.current_ep--;
-                    await saveAnime(anime);
-                    updateUI(); 
+                    await updateAnimeFields(anime.id, { current_ep: anime.current_ep });
+                    updateUI();
                 }
             };
         }
@@ -546,14 +465,12 @@ function renderDetail(anime) {
     statusSelect.addEventListener('change', async () => {
         const newStatus = statusSelect.value;
         anime.status = newStatus;
-
-        if (newStatus === 'completed') {
-            if (!isNaN(totalEps)) {
-                anime.current_ep = totalEps;
-            }
+        const fields = { status: newStatus };
+        if (newStatus === 'completed' && !isNaN(totalEps)) {
+            anime.current_ep = totalEps;
+            fields.current_ep = totalEps;
         }
-        
-        await saveAnime(anime);
+        await updateAnimeFields(anime.id, fields);
         updateUI();
     });
 
@@ -569,13 +486,13 @@ function renderDetail(anime) {
             <input type="number" id="manual-ep-input" value="${anime.current_ep}" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--bg-color); color: white; font-size: 1.2rem; text-align: center; margin-top: 10px;">
         `, [
             {
-                text: 'Salvar', 
-                class: 'btn-confirm', 
+                text: 'Salvar',
+                class: 'btn-confirm',
                 action: async () => {
                     const val = document.getElementById('manual-ep-input').value;
                     if (val !== "") {
                         anime.current_ep = parseInt(val);
-                        await saveAnime(anime);
+                        await updateAnimeFields(anime.id, { current_ep: anime.current_ep });
                         updateUI();
                         UI.hideModal();
                     }
@@ -588,10 +505,43 @@ function renderDetail(anime) {
     updateUI();
 }
 
-// ---------- EVENT LISTENERS ----------
-searchBtn.addEventListener('click', searchAnime);
-searchInput.addEventListener('keypress', e => { if (e.key === 'Enter') searchAnime(); });
-clearBtn.addEventListener('click', () => { searchInput.value=''; clearBtn.style.display='none'; searchResults.style.display='none'; renderGrid(document.querySelector('.filter-btn.active').dataset.filter, ''); });
+async function deleteAnime(id_db) {
+    const anime = myAnimeList.find(a => a.id === id_db);
+    if (!anime) return;
+    UI.showModal('Remover Anime', `Tem certeza que deseja remover <strong>${anime.title}</strong>?`, [
+        {
+            text: 'Sim, remover', class: 'btn-confirm', action: async () => {
+                await removeAnime(id_db);
+                await loadList();
+                renderGrid(document.querySelector('.filter-btn.active').dataset.filter, searchInput.value.trim());
+                UI.hideModal();
+            }
+        },
+        { text: 'Cancelar', class: 'btn-cancel', action: UI.hideModal }
+    ]);
+}
+
+// ---------- EVENTOS ----------
+
+searchBtn.addEventListener('click', () => {
+    clearTimeout(searchTimeout);
+    fetchSuggestions();
+});
+
+searchInput.addEventListener('keypress', e => {
+    if (e.key === 'Enter') {
+        clearTimeout(searchTimeout);
+        fetchSuggestions();
+    }
+});
+
+clearBtn.addEventListener('click', () => {
+    searchInput.value = '';
+    clearBtn.style.display = 'none';
+    searchResults.style.display = 'none';
+    renderGrid(document.querySelector('.filter-btn.active').dataset.filter, '');
+});
+
 searchInput.addEventListener('input', () => {
     const q = searchInput.value.trim();
     clearBtn.style.display = q.length ? 'flex' : 'none';
@@ -600,7 +550,9 @@ searchInput.addEventListener('input', () => {
     clearTimeout(searchTimeout);
     searchTimeout = setTimeout(fetchSuggestions, 400);
 });
+
 closeModal.addEventListener('click', UI.hideModal);
+
 filterBtns.forEach(btn => {
     btn.addEventListener('click', () => {
         filterBtns.forEach(b => b.classList.remove('active'));
@@ -609,7 +561,6 @@ filterBtns.forEach(btn => {
     });
 });
 
-// NEW: Sort and Category listeners
 sortSelect.addEventListener('change', () => {
     renderGrid(document.querySelector('.filter-btn.active').dataset.filter, searchInput.value.trim());
 });
@@ -621,16 +572,10 @@ genreSelect.addEventListener('change', () => {
 function updateGenreDropdown() {
     const genres = new Set();
     myAnimeList.forEach(anime => {
-        if (anime.genres) {
-            anime.genres.forEach(g => genres.add(g));
-        }
+        if (anime.genres) anime.genres.forEach(g => genres.add(g));
     });
-
     const sortedGenres = Array.from(genres).sort();
-    
-    // Save current value to restore it after rebuild
     const currentVal = genreSelect.value;
-    
     genreSelect.innerHTML = '<option value="all">Todas as Categorias</option>';
     sortedGenres.forEach(genre => {
         const option = document.createElement('option');
@@ -638,13 +583,10 @@ function updateGenreDropdown() {
         option.innerText = genre;
         genreSelect.appendChild(option);
     });
-    
     genreSelect.value = currentVal;
 }
 
-// Init
 async function initApp() {
-    await syncLocalStorage();
     await loadList();
     renderGrid('watching');
 }
@@ -654,7 +596,5 @@ window.addEventListener('load', async () => {
     if (isLoggedIn) {
         await initApp();
     }
-
     loginForm.addEventListener('submit', handleLogin);
 });
-
