@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'v2'; // 👈 sempre que atualizar o app, muda esse número
+const CACHE_VERSION = 'v2.1'; // 👈 sempre que atualizar o app, muda esse número
 const CACHE_NAME = `anime-os-cache-${CACHE_VERSION}`;
 const ASSETS = [
   './',
