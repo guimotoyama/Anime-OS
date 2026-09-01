@@ -7,6 +7,9 @@ const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 let myAnimeList = [];
 let currentSelectedAnime = null;
 let searchTimeout = null;
+let nextEpisodeCache = {};
+let searchRequestId = 0; // usado para ignorar respostas de buscas antigas/obsoletas
+let focusedCardIndex = -1; // índice do card atualmente destacado via teclado
 
 const aniListLimiter = {
     queue: [],
@@ -144,6 +147,78 @@ async function translateToPtBr(text) {
     }
 }
 
+// ---------- DADOS DINÂMICOS (próximo episódio + auto-preenchimento) ----------
+
+function formatAiringCountdown(airingAtUnix) {
+    const diffMs = (airingAtUnix * 1000) - Date.now();
+    const diffSeconds = Math.floor(diffMs / 1000);
+    if (diffSeconds <= 0) return 'a qualquer momento';
+    const days = Math.floor(diffSeconds / 86400);
+    const hours = Math.floor((diffSeconds % 86400) / 3600);
+    if (days > 0) return `em ${days}d ${hours}h`;
+    const minutes = Math.floor((diffSeconds % 3600) / 60);
+    if (hours > 0) return `em ${hours}h ${minutes}min`;
+    return `em ${minutes}min`;
+}
+
+async function refreshLiveAniListData() {
+    const candidates = myAnimeList.filter(a =>
+        (a.status === 'watching' || a.status === 'planned') &&
+        !isNaN(parseInt(a.mal_id))
+    );
+    if (candidates.length === 0) return;
+
+    const uniqueIds = [...new Set(candidates.map(a => parseInt(a.mal_id)))];
+    const chunkSize = 50; // limite do Page da AniList
+    const chunks = [];
+    for (let i = 0; i < uniqueIds.length; i += chunkSize) {
+        chunks.push(uniqueIds.slice(i, i + chunkSize));
+    }
+
+    const gqlQuery = `
+        query ($ids: [Int]) {
+            Page(perPage: 50) {
+                media(id_in: $ids, type: ANIME) {
+                    id
+                    episodes
+                    seasonYear
+                    nextAiringEpisode { airingAt episode }
+                }
+            }
+        }
+    `;
+
+    nextEpisodeCache = {};
+    for (const chunk of chunks) {
+        try {
+            const data = await queryAniList(gqlQuery, { ids: chunk });
+            const mediaList = data?.Page?.media || [];
+            for (const m of mediaList) {
+                if (m.nextAiringEpisode) {
+                    nextEpisodeCache[m.id] = m.nextAiringEpisode;
+                }
+                // Só grava no banco o que estiver faltando — nunca sobrescreve dados já existentes
+                const matches = candidates.filter(a => parseInt(a.mal_id) === m.id);
+                for (const dbAnime of matches) {
+                    const fields = {};
+                    if ((!dbAnime.total_ep || dbAnime.total_ep === 0) && m.episodes) {
+                        fields.total_ep = m.episodes;
+                    }
+                    if (!dbAnime.year && m.seasonYear) {
+                        fields.year = m.seasonYear;
+                    }
+                    if (Object.keys(fields).length > 0) {
+                        await updateAnimeFields(dbAnime.id, fields);
+                        Object.assign(dbAnime, fields);
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn('Falha ao atualizar dados dinâmicos da AniList:', e.message);
+        }
+    }
+}
+
 const authContainer = document.getElementById('auth-container');
 const loginForm = document.getElementById('login-form');
 const authEmail = document.getElementById('auth-email');
@@ -164,6 +239,8 @@ const modalBody = document.getElementById('modal-body');
 const modalFooter = document.getElementById('modal-footer');
 const closeModal = document.getElementById('modal-close-x');
 const searchResults = document.getElementById('search-results');
+const toastContainer = document.getElementById('toast-container');
+const mainContent = document.getElementById('main-content');
 
 function toggleAuthUI(isLoggedIn) {
     authContainer.style.display = isLoggedIn ? 'none' : 'flex';
@@ -215,6 +292,20 @@ const UI = {
     },
     hideModal() {
         modal.style.display = 'none';
+    },
+    showToast(message, type = 'success', duration = 3000) {
+        const icons = { success: '✅', error: '❌', info: 'ℹ️' };
+        const toast = document.createElement('div');
+        toast.className = `toast toast-${type}`;
+        toast.innerHTML = `<span>${icons[type] || ''}</span><span>${message}</span>`;
+        toastContainer.appendChild(toast);
+
+        requestAnimationFrame(() => toast.classList.add('show'));
+
+        setTimeout(() => {
+            toast.classList.remove('show');
+            setTimeout(() => toast.remove(), 350);
+        }, duration);
     }
 };
 
@@ -230,7 +321,7 @@ async function loadList() {
 
 async function addAnimeToDB(anime) {
     const { data: { user } } = await supabaseClient.auth.getUser();
-    if (!user) { console.error('Usuário não autenticado.'); return; }
+    if (!user) { console.error('Usuário não autenticado.'); return { success: false, reason: 'auth' }; }
 
     const { error } = await supabaseClient.from('animes').insert([{
         mal_id: anime.mal_id,
@@ -247,7 +338,16 @@ async function addAnimeToDB(anime) {
         synopsis_lang: anime.synopsis_lang || 'pt',
         user_id: user.id
     }]);
-    if (error) console.error('Erro ao adicionar anime:', error);
+
+    if (error) {
+        if (error.code === '23505') {
+            console.warn('Inserção bloqueada: anime já existe na lista.', anime.title);
+            return { success: false, reason: 'duplicate' };
+        }
+        console.error('Erro ao adicionar anime:', error);
+        return { success: false, reason: 'unknown' };
+    }
+    return { success: true };
 }
 
 async function updateAnimeFields(id, fields) {
@@ -261,9 +361,116 @@ async function removeAnime(id_db) {
 
 // ---------- BUSCA DE NOVOS ANIMES (AniList) ----------
 
+function getStatusLabel(status) {
+    return status === 'watching' ? '🔵 Assistindo'
+        : status === 'completed' ? '✅ Concluído'
+        : '⏳ Planejado';
+}
+
+function findExistingAnime(anilistId) {
+    return myAnimeList.find(a => parseInt(a.mal_id) === parseInt(anilistId));
+}
+
+function showDuplicateWarning(existingAnime) {
+    UI.showModal('Anime já na sua lista', `
+        <p>O anime <strong>${existingAnime.title}</strong> já está cadastrado como:</p>
+        <p style="margin-top:12px;font-size:1.1rem;text-align:center;">${getStatusLabel(existingAnime.status)}</p>
+    `, [
+        {
+            text: 'Ver Anime',
+            class: 'btn-confirm',
+            action: () => {
+                UI.hideModal();
+                filterBtns.forEach(b => b.classList.toggle('active', b.dataset.filter === existingAnime.status));
+                showDetail(existingAnime.id);
+            }
+        },
+        { text: 'Fechar', class: 'btn-cancel', action: UI.hideModal }
+    ]);
+}
+
+const SEARCH_CACHE_PREFIX = 'anilist_search_';
+const SEARCH_CACHE_TTL = 10 * 60 * 1000; // 10 minutos
+
+function normalizeSearchQuery(q) {
+    return q.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function getSearchCache(query) {
+    try {
+        const raw = localStorage.getItem(SEARCH_CACHE_PREFIX + query);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (Date.now() - parsed.timestamp > SEARCH_CACHE_TTL) {
+            localStorage.removeItem(SEARCH_CACHE_PREFIX + query);
+            return null;
+        }
+        return parsed.data;
+    } catch (e) {
+        return null;
+    }
+}
+
+function setSearchCache(query, data) {
+    try {
+        localStorage.setItem(SEARCH_CACHE_PREFIX + query, JSON.stringify({ data, timestamp: Date.now() }));
+    } catch (e) {
+        // localStorage cheio ou indisponível — ignora silenciosamente, não é crítico
+    }
+}
+
+function cleanupSearchCache() {
+    try {
+        const now = Date.now();
+        const keysToRemove = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key && key.startsWith(SEARCH_CACHE_PREFIX)) {
+                try {
+                    const parsed = JSON.parse(localStorage.getItem(key));
+                    if (!parsed || (now - parsed.timestamp > SEARCH_CACHE_TTL)) {
+                        keysToRemove.push(key);
+                    }
+                } catch (e) {
+                    keysToRemove.push(key); // entrada corrompida
+                }
+            }
+        }
+        keysToRemove.forEach(k => localStorage.removeItem(k));
+    } catch (e) {
+        // localStorage indisponível — ignora
+    }
+}
+
+function showSearchLoading() {
+    searchResults.innerHTML = `<div class="search-loading"><span class="mini-spinner"></span> Buscando...</div>`;
+    searchResults.style.display = 'block';
+}
+
+function renderSearchOutcome(animes) {
+    if (animes.length > 0) {
+        renderSuggestions(animes);
+    } else {
+        searchResults.innerHTML = '<div style="padding:15px;color:var(--text-dim);">Nenhum resultado encontrado.</div>';
+        searchResults.style.display = 'block';
+    }
+}
+
 async function fetchSuggestions() {
     const query = searchInput.value.trim();
     if (query.length < 3) { searchResults.style.display = 'none'; return; }
+
+    const normalizedQuery = normalizeSearchQuery(query);
+    const requestId = ++searchRequestId;
+
+    // 1. Cache hit -> resposta instantânea, sem chamar a AniList
+    const cached = getSearchCache(normalizedQuery);
+    if (cached) {
+        renderSearchOutcome(cached);
+        return;
+    }
+
+    showSearchLoading();
 
     const gqlQuery = `
         query ($search: String) {
@@ -282,14 +489,13 @@ async function fetchSuggestions() {
     `;
     try {
         const data = await queryAniList(gqlQuery, { search: query });
+        if (requestId !== searchRequestId) return; // busca mais nova já foi disparada, ignora esta resposta
+
         const animes = data?.Page?.media || [];
-        if (animes.length > 0) {
-            renderSuggestions(animes);
-        } else {
-            searchResults.innerHTML = '<div style="padding:15px;color:var(--text-dim);">Nenhum resultado encontrado.</div>';
-            searchResults.style.display = 'block';
-        }
+        setSearchCache(normalizedQuery, animes);
+        renderSearchOutcome(animes);
     } catch (e) {
+        if (requestId !== searchRequestId) return;
         console.warn('Busca falhou:', e.message);
         searchResults.innerHTML = `<div style="padding:15px;color:var(--text-dim);">${e.message}</div>`;
         searchResults.style.display = 'block';
@@ -306,9 +512,14 @@ function renderSuggestions(animes) {
         item.className = 'result-item';
         item.innerHTML = `<img src="${imgUrl}" alt="${title}"><span class="title">${title}</span>`;
         item.onclick = () => {
-            currentSelectedAnime = anime;
-            showStatusPicker();
             searchResults.style.display = 'none';
+            const existing = findExistingAnime(anime.id);
+            if (existing) {
+                showDuplicateWarning(existing);
+            } else {
+                currentSelectedAnime = anime;
+                showStatusPicker();
+            }
         };
         searchResults.appendChild(item);
     });
@@ -349,17 +560,35 @@ async function finalizeAdd(status) {
         synopsis_lang: translationResult.success ? 'pt' : 'en',
         genres: anime.genres || [],
     };
-    await addAnimeToDB(newAnime);
+
+    const result = await addAnimeToDB(newAnime);
+
+    if (!result.success) {
+        UI.hideModal();
+        if (result.reason === 'duplicate') {
+            await loadList();
+            const existing = findExistingAnime(anime.id);
+            if (existing) showDuplicateWarning(existing);
+        } else {
+            UI.showModal('Erro', 'Não foi possível adicionar o anime. Tente novamente.', [
+                { text: 'Ok', class: 'btn-confirm', action: UI.hideModal }
+            ]);
+        }
+        return;
+    }
+
     await loadList();
     searchInput.value = '';
     clearBtn.style.display = 'none';
     UI.hideModal();
     renderGrid(document.querySelector('.filter-btn.active').dataset.filter, '');
+    UI.showToast(`"${newAnime.title}" adicionado com sucesso!`, 'success');
 }
 
 // ---------- GRID PRINCIPAL ----------
 
 function renderGrid(filter, query = '') {
+    focusedCardIndex = -1; // grid foi refeito, qualquer navegação anterior perde sentido
     let list = myAnimeList.filter(a => a.status === filter);
 
     if (query) {
@@ -405,6 +634,11 @@ function renderGrid(filter, query = '') {
             metaRight = `<span class="ep-planned">${anime.total_ep || '?'} Episódios</span>`;
         }
 
+                const nextEp = nextEpisodeCache[parseInt(anime.mal_id)];
+        const nextEpHTML = nextEp
+            ? `<div class="next-ep-info">🕐 Ep ${nextEp.episode} ${formatAiringCountdown(nextEp.airingAt)}</div>`
+            : '';
+
         const card = document.createElement('div');
         card.className = 'anime-card';
         card.innerHTML = `
@@ -417,8 +651,10 @@ function renderGrid(filter, query = '') {
                     <span class="meta-year">${anime.year || 'N/A'}</span>
                     ${metaRight}
                 </div>
+                ${nextEpHTML}
             </div>
         `;
+        
         card.querySelector('.delete-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             deleteAnime(anime.id);
@@ -529,6 +765,11 @@ function renderDetail(anime) {
                     <div class="stat-item"><span class="stat-label">Ano</span><span class="stat-value">${year}</span></div>
                     <div class="stat-item"><span class="stat-label">Episódios</span><span class="stat-value">${episodesStr}</span></div>
                     <div class="stat-item"><span class="stat-label">Gêneros</span><span class="stat-value">${genres}</span></div>
+                    ${(() => {
+                        const nextEp = nextEpisodeCache[parseInt(anime.mal_id)];
+                        if (!nextEp) return '';
+                        return `<div class="stat-item"><span class="stat-label">Próximo Episódio</span><span class="stat-value">Ep ${nextEp.episode} • ${formatAiringCountdown(nextEp.airingAt)}</span></div>`;
+                    })()}
                 </div>
                 <div class="progress-tracker" id="progress-tracker">
                     <div id="progress-content"></div>
@@ -632,6 +873,7 @@ if (altTitlesContainer) {
         }
         await updateAnimeFields(anime.id, fields);
         updateUI();
+        UI.showToast(`Status atualizado para ${getStatusLabel(newStatus)}`, 'success');
     });
 
     document.getElementById('back-btn').onclick = () => {
@@ -655,6 +897,7 @@ if (altTitlesContainer) {
                         await updateAnimeFields(anime.id, { current_ep: anime.current_ep });
                         updateUI();
                         UI.hideModal();
+                        UI.showToast(`Progresso atualizado: Ep ${anime.current_ep}`, 'success');
                     }
                 }
             },
@@ -675,6 +918,7 @@ async function deleteAnime(id_db) {
                 await loadList();
                 renderGrid(document.querySelector('.filter-btn.active').dataset.filter, searchInput.value.trim());
                 UI.hideModal();
+                UI.showToast(`"${anime.title}" removido da lista.`, 'info');
             }
         },
         { text: 'Cancelar', class: 'btn-cancel', action: UI.hideModal }
@@ -890,6 +1134,17 @@ searchInput.addEventListener('input', () => {
     const activeFilter = document.querySelector('.filter-btn.active').dataset.filter;
     renderGrid(activeFilter, q);
     clearTimeout(searchTimeout);
+
+    if (q.length < 3) { searchResults.style.display = 'none'; return; }
+
+    // Se já temos cache pra esse termo, mostra na hora, sem esperar o debounce
+    const cached = getSearchCache(normalizeSearchQuery(q));
+    if (cached) {
+        searchRequestId++; // invalida qualquer busca anterior ainda pendente
+        renderSearchOutcome(cached);
+        return;
+    }
+
     searchTimeout = setTimeout(fetchSuggestions, 400);
 });
 
@@ -918,6 +1173,142 @@ genreSelect.addEventListener('change', () => {
     renderGrid(document.querySelector('.filter-btn.active').dataset.filter, searchInput.value.trim());
 });
 
+// ---------- ATALHOS DE TECLADO ----------
+
+function getVisibleCards() {
+    return Array.from(animeGrid.querySelectorAll('.anime-card'));
+}
+
+function getGridColumns() {
+    const cols = getComputedStyle(animeGrid).gridTemplateColumns.split(' ');
+    return cols.length || 1;
+}
+
+function setFocusedCard(index) {
+    const cards = getVisibleCards();
+    cards.forEach(c => c.classList.remove('card-focused'));
+    if (index < 0 || index >= cards.length) { focusedCardIndex = -1; return; }
+    focusedCardIndex = index;
+    cards[index].classList.add('card-focused');
+    cards[index].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function showShortcutsHelp() {
+    UI.showModal('Atalhos de Teclado', `
+        <div class="shortcut-row"><span>Focar na busca</span><kbd>/</kbd></div>
+        <div class="shortcut-row"><span>Fechar / voltar / limpar</span><kbd>Esc</kbd></div>
+        <div class="shortcut-row"><span>Assistindo</span><kbd>1</kbd></div>
+        <div class="shortcut-row"><span>Concluídos</span><kbd>2</kbd></div>
+        <div class="shortcut-row"><span>Planejados</span><kbd>3</kbd></div>
+        <div class="shortcut-row"><span>Navegar pelos cards</span><kbd>← ↑ → ↓</kbd></div>
+        <div class="shortcut-row"><span>Abrir card selecionado</span><kbd>Enter</kbd></div>
+        <div class="shortcut-row"><span>Mostrar esta ajuda</span><kbd>?</kbd></div>
+    `, [{ text: 'Ok', class: 'btn-confirm', action: UI.hideModal }]);
+}
+
+document.addEventListener('keydown', (e) => {
+    const activeTag = document.activeElement.tagName;
+    const isTyping = ['INPUT', 'TEXTAREA', 'SELECT'].includes(activeTag);
+    const modalOpen = modal.style.display === 'flex';
+    const inDetailView = animeDetail.style.display === 'block';
+
+    // Esc funciona sempre, mesmo digitando — em cascata, do mais "no topo" pro mais "no fundo"
+    if (e.key === 'Escape') {
+        if (modalOpen) { UI.hideModal(); return; }
+        if (inDetailView) { document.getElementById('back-btn')?.click(); return; }
+        if (searchResults.style.display === 'block') { searchResults.style.display = 'none'; return; }
+        if (searchInput.value) { clearBtn.click(); return; }
+        searchInput.blur();
+        return;
+    }
+
+    if (isTyping || modalOpen) return; // demais atalhos não valem enquanto digita ou com modal aberto
+
+    if (e.key === '/') {
+        e.preventDefault();
+        searchInput.focus();
+        return;
+    }
+
+    if (e.key === '?') {
+        e.preventDefault();
+        showShortcutsHelp();
+        return;
+    }
+
+    if (!inDetailView && ['1', '2', '3'].includes(e.key)) {
+        const map = { '1': 'watching', '2': 'completed', '3': 'planned' };
+        document.querySelector(`.filter-btn[data-filter="${map[e.key]}"]`)?.click();
+        return;
+    }
+
+    if (!inDetailView) {
+        const cards = getVisibleCards();
+        if (cards.length === 0) return;
+        const cols = getGridColumns();
+
+        if (e.key === 'ArrowRight') {
+            e.preventDefault();
+            setFocusedCard(Math.min((focusedCardIndex < 0 ? -1 : focusedCardIndex) + 1, cards.length - 1));
+        } else if (e.key === 'ArrowLeft') {
+            e.preventDefault();
+            setFocusedCard(Math.max(focusedCardIndex - 1, 0));
+        } else if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            setFocusedCard(Math.min((focusedCardIndex < 0 ? 0 : focusedCardIndex + cols), cards.length - 1));
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            setFocusedCard(Math.max(focusedCardIndex - cols, 0));
+        } else if (e.key === 'Enter' && focusedCardIndex >= 0) {
+            e.preventDefault();
+            cards[focusedCardIndex].click();
+        }
+    }
+});
+
+// ---------- SWIPE MOBILE (trocar categoria arrastando) ----------
+
+let touchStartX = 0;
+let touchStartY = 0;
+
+function handleCategorySwipe(deltaX) {
+    const order = Array.from(filterBtns).map(b => b.dataset.filter);
+    const activeBtn = document.querySelector('.filter-btn.active');
+    const currentIndex = order.indexOf(activeBtn.dataset.filter);
+    let newIndex = currentIndex;
+
+    if (deltaX < 0 && currentIndex < order.length - 1) {
+        newIndex = currentIndex + 1; // swipe para a esquerda -> próxima categoria
+    } else if (deltaX > 0 && currentIndex > 0) {
+        newIndex = currentIndex - 1; // swipe para a direita -> categoria anterior
+    }
+
+    if (newIndex !== currentIndex) {
+        document.querySelector(`.filter-btn[data-filter="${order[newIndex]}"]`)?.click();
+    }
+}
+
+mainContent.addEventListener('touchstart', (e) => {
+    if (animeGrid.style.display === 'none') return; // ignora dentro da tela de detalhes
+    touchStartX = e.changedTouches[0].screenX;
+    touchStartY = e.changedTouches[0].screenY;
+}, { passive: true });
+
+mainContent.addEventListener('touchend', (e) => {
+    if (animeGrid.style.display === 'none') return;
+    const touchEndX = e.changedTouches[0].screenX;
+    const touchEndY = e.changedTouches[0].screenY;
+    const deltaX = touchEndX - touchStartX;
+    const deltaY = touchEndY - touchStartY;
+
+    const SWIPE_THRESHOLD = 60;
+    const isHorizontal = Math.abs(deltaX) > Math.abs(deltaY);
+
+    if (isHorizontal && Math.abs(deltaX) > SWIPE_THRESHOLD) {
+        handleCategorySwipe(deltaX);
+    }
+}, { passive: true });
+
 function updateGenreDropdown() {
     const genres = new Set();
     myAnimeList.forEach(anime => {
@@ -938,9 +1329,13 @@ function updateGenreDropdown() {
 async function initApp() {
     await loadList();
     renderGrid('watching');
+    refreshLiveAniListData().then(() => {
+        renderGrid(document.querySelector('.filter-btn.active').dataset.filter, searchInput.value.trim());
+    });
 }
 
 window.addEventListener('load', async () => {
+    cleanupSearchCache();
     const isLoggedIn = await checkUserSession();
     if (isLoggedIn) {
         await initApp();
