@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'v2.2'; // 👈 sempre que atualizar o app, muda esse número
+const CACHE_VERSION = 'v2.3';
 const CACHE_NAME = `anime-os-cache-${CACHE_VERSION}`;
 const ASSETS = [
   './',
@@ -9,7 +9,7 @@ const ASSETS = [
 ];
 
 self.addEventListener('install', (event) => {
-  self.skipWaiting(); // ativa o novo SW imediatamente, sem esperar todas as abas fecharem
+  self.skipWaiting();
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
       return cache.addAll(ASSETS);
@@ -22,15 +22,22 @@ self.addEventListener('activate', (event) => {
     caches.keys().then((cacheNames) => {
       return Promise.all(
         cacheNames
-          .filter((name) => name !== CACHE_NAME) // apaga qualquer cache com nome diferente do atual
+          .filter((name) => name !== CACHE_NAME)
           .map((name) => caches.delete(name))
       );
-    }).then(() => self.clients.claim()) // assume controle das abas abertas imediatamente
+    }).then(() => self.clients.claim())
   );
 });
 
 self.addEventListener('fetch', (event) => {
-  // Network-first para HTML e JS (sempre tenta buscar a versão mais nova primeiro)
+  const requestUrl = new URL(event.request.url);
+
+  // 🚨 Ignora completamente requisições para outros domínios (APIs externas)
+  // Deixa o navegador cuidar delas normalmente, sem passar pelo Service Worker.
+  if (requestUrl.origin !== self.location.origin) {
+    return;
+  }
+
   if (event.request.mode === 'navigate' || event.request.url.endsWith('.js')) {
     event.respondWith(
       fetch(event.request)
@@ -39,12 +46,11 @@ self.addEventListener('fetch', (event) => {
           caches.open(CACHE_NAME).then((cache) => cache.put(event.request, cloned));
           return response;
         })
-        .catch(() => caches.match(event.request)) // se estiver offline, usa o cache como reserva
+        .catch(() => caches.match(event.request))
     );
     return;
   }
 
-  // Cache-first para o resto (CSS, imagens) — não muda com tanta frequência
   event.respondWith(
     caches.match(event.request).then((response) => {
       return response || fetch(event.request);
