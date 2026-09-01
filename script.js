@@ -8,9 +8,54 @@ let myAnimeList = [];
 let currentSelectedAnime = null;
 let searchTimeout = null;
 
-async function queryAniList(query, variables = {}, retries = 2) {
+const aniListLimiter = {
+    queue: [],
+    processing: false,
+    remaining: 30,
+    resetAt: 0,
+    minGapMs: 2000, // AniList está em modo: 30 req/min = 1 a cada 2 segundos
+
+    schedule(job) {
+        return new Promise((resolve, reject) => {
+            this.queue.push({ job, resolve, reject });
+            this._run();
+        });
+    },
+
+    async _run() {
+        if (this.processing) return;
+        this.processing = true;
+        while (this.queue.length) {
+            const now = Date.now();
+            if (this.remaining <= 1 && this.resetAt > now) {
+                await new Promise(r => setTimeout(r, this.resetAt - now + 300));
+            }
+            const { job, resolve, reject } = this.queue.shift();
+            try {
+                resolve(await job());
+            } catch (e) {
+                reject(e);
+            }
+            await new Promise(r => setTimeout(r, this.minGapMs));
+        }
+        this.processing = false;
+    },
+
+    updateFromHeaders(headers) {
+        const rem = headers.get('x-ratelimit-remaining');
+        const reset = headers.get('x-ratelimit-reset');
+        if (rem !== null && !isNaN(parseInt(rem))) this.remaining = parseInt(rem, 10);
+        if (reset !== null && !isNaN(parseInt(reset))) this.resetAt = parseInt(reset, 10) * 1000;
+    }
+};
+
+async function queryAniList(query, variables = {}) {
+    return aniListLimiter.schedule(() => performAniListRequest(query, variables));
+}
+
+async function performAniListRequest(query, variables, retriesLeft = 3) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
     try {
         const response = await fetch(API_URL, {
             method: 'POST',
@@ -19,15 +64,32 @@ async function queryAniList(query, variables = {}, retries = 2) {
             signal: controller.signal
         });
         clearTimeout(timeoutId);
+        aniListLimiter.updateFromHeaders(response.headers);
 
-        if ((response.status === 429 || response.status >= 500) && retries > 0) {
-            await new Promise(r => setTimeout(r, 800));
-            return queryAniList(query, variables, retries - 1);
+        if (response.status === 429) {
+            if (retriesLeft <= 0) throw new Error('Limite da AniList excedido. Tente novamente em breve.');
+            const retryAfter = parseInt(response.headers.get('Retry-After') || '5', 10);
+            aniListLimiter.remaining = 0;
+            aniListLimiter.resetAt = Date.now() + retryAfter * 1000;
+            await new Promise(r => setTimeout(r, retryAfter * 1000 + 300));
+            return performAniListRequest(query, variables, retriesLeft - 1);
         }
+
+        if (response.status === 404) {
+            const err = new Error('Anime não encontrado na AniList.');
+            err.code = 'NOT_FOUND';
+            throw err;
+        }
+
+        if (response.status >= 500 && retriesLeft > 0) {
+            await new Promise(r => setTimeout(r, 1200));
+            return performAniListRequest(query, variables, retriesLeft - 1);
+        }
+
         if (!response.ok) throw new Error(`Erro na AniList: ${response.status}`);
 
         const json = await response.json();
-        if (json.errors) throw new Error(json.errors[0].message);
+        if (json.errors) throw new Error(json.errors[0]?.message || 'Erro desconhecido na AniList');
         return json.data;
     } catch (e) {
         clearTimeout(timeoutId);
@@ -38,7 +100,7 @@ async function queryAniList(query, variables = {}, retries = 2) {
 
 function getBestTitle(titleObj) {
     if (!titleObj) return 'Título Indisponível';
-    return titleObj.english || titleObj.romaji || titleObj.native || 'Título Indisponível';
+    return titleObj.english || titleObj.romaji || 'Título Indisponível';
 }
 
 function cleanDescription(desc) {
@@ -60,40 +122,6 @@ function splitTextForTranslation(text, maxLen = 1500) {
     }
     if (current) chunks.push(current);
     return chunks;
-}
-
-async function migrateOldSynopses() {
-    const { data, error } = await supabaseClient
-        .from('animes')
-        .select('id, title, synopsis, synopsis_lang')
-        .not('synopsis', 'is', null)
-        .neq('synopsis_lang', 'pt');
-
-    if (error) { console.error('Erro ao buscar animes para migração:', error); return; }
-    if (!data || data.length === 0) { console.log('Nada para traduzir. Todos já estão em PT-BR.'); return; }
-
-    console.log(`Iniciando tradução de ${data.length} anime(s)...`);
-    let sucesso = 0, falha = 0;
-
-    for (const anime of data) {
-        try {
-            const translated = await translateToPtBr(anime.synopsis);
-            await supabaseClient
-                .from('animes')
-                .update({ synopsis: translated, synopsis_lang: 'pt' })
-                .eq('id', anime.id);
-            console.log(`✅ Traduzido: ${anime.title}`);
-            sucesso++;
-        } catch (e) {
-            console.warn(`❌ Falhou: ${anime.title}`, e.message);
-            falha++;
-        }
-        await new Promise(r => setTimeout(r, 500)); // evita sobrecarregar o serviço gratuito
-    }
-
-    console.log(`Migração concluída. Sucesso: ${sucesso} | Falhas: ${falha}`);
-    await loadList();
-    renderGrid(document.querySelector('.filter-btn.active').dataset.filter, '');
 }
 
 async function translateToPtBr(text) {
@@ -201,9 +229,14 @@ async function loadList() {
 }
 
 async function addAnimeToDB(anime) {
+    const { data: { user } } = await supabaseClient.auth.getUser();
+    if (!user) { console.error('Usuário não autenticado.'); return; }
+
     const { error } = await supabaseClient.from('animes').insert([{
         mal_id: anime.mal_id,
         title: anime.title,
+        title_english: anime.title_english || null,
+        title_romaji: anime.title_romaji || null,
         status: anime.status,
         current_ep: anime.current_ep || 0,
         total_ep: anime.total_ep || 0,
@@ -211,7 +244,8 @@ async function addAnimeToDB(anime) {
         year: anime.year,
         genres: anime.genres || [],
         synopsis: anime.synopsis || null,
-        synopsis_lang: anime.synopsis_lang || 'pt'
+        synopsis_lang: anime.synopsis_lang || 'pt',
+        user_id: user.id
     }]);
     if (error) console.error('Erro ao adicionar anime:', error);
 }
@@ -236,7 +270,7 @@ async function fetchSuggestions() {
             Page(perPage: 15) {
                 media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
                     id
-                    title { english romaji native }
+                    title { english romaji }
                     coverImage { large }
                     seasonYear
                     episodes
@@ -301,18 +335,20 @@ async function finalizeAdd(status) {
     const rawSynopsis = cleanDescription(anime.description);
     const translationResult = await translateToPtBr(rawSynopsis);
 
-const newAnime = {
-    mal_id: anime.id,
-    title: getBestTitle(anime.title),
-    cover_url: anime.coverImage?.large,
-    year: anime.seasonYear || null,
-    total_ep: totalEp,
-    status: status,
-    current_ep: status === 'completed' ? totalEp : 0,
-    synopsis: translationResult.text,
-    synopsis_lang: translationResult.success ? 'pt' : 'en',
-    genres: anime.genres || [],
-};
+    const newAnime = {
+        mal_id: anime.id,
+        title: getBestTitle(anime.title),
+        title_english: anime.title?.english || null,
+        title_romaji: anime.title?.romaji || null,
+        cover_url: anime.coverImage?.large,
+        year: anime.seasonYear || null,
+        total_ep: totalEp,
+        status: status,
+        current_ep: status === 'completed' ? totalEp : 0,
+        synopsis: translationResult.text,
+        synopsis_lang: translationResult.success ? 'pt' : 'en',
+        genres: anime.genres || [],
+    };
     await addAnimeToDB(newAnime);
     await loadList();
     searchInput.value = '';
@@ -328,7 +364,11 @@ function renderGrid(filter, query = '') {
 
     if (query) {
         const q = query.toLowerCase();
-        list = list.filter(a => a.title.toLowerCase().includes(q));
+        list = list.filter(a =>
+            a.title.toLowerCase().includes(q) ||
+            (a.title_english && a.title_english.toLowerCase().includes(q)) ||
+            (a.title_romaji && a.title_romaji.toLowerCase().includes(q))
+        );
     }
 
     const genreVal = genreSelect.value;
@@ -410,6 +450,7 @@ async function showDetail(id_db) {
         const gqlQuery = `
             query ($id: Int) {
                 Media(id: $id, type: ANIME) {
+                    title { english romaji }
                     description
                     genres
                     episodes
@@ -425,15 +466,16 @@ async function showDetail(id_db) {
         const rawSynopsis = cleanDescription(m.description);
         const translationResult = await translateToPtBr(rawSynopsis);
 
-const updatedFields = {
-    synopsis: translationResult.text,
-    synopsis_lang: translationResult.success ? 'pt' : 'en',
-    genres: m.genres || [],
-    total_ep: m.episodes || 0,
-    year: m.seasonYear || null,
-    cover_url: anime.cover_url || m.coverImage?.large
-};
-
+        const updatedFields = {
+            synopsis: translationResult.text,
+            synopsis_lang: translationResult.success ? 'pt' : 'en',
+            genres: m.genres || [],
+            total_ep: m.episodes || 0,
+            year: m.seasonYear || null,
+            cover_url: anime.cover_url || m.coverImage?.large,
+            title_english: m.title?.english || null,
+            title_romaji: m.title?.romaji || null
+        };
         await updateAnimeFields(id_db, updatedFields);
         Object.assign(anime, updatedFields);
         UI.hideModal();
@@ -456,9 +498,15 @@ function renderDetail(anime) {
         <div class="detail-header">
             <img src="${image}" alt="${anime.title}">
             <div class="detail-overlay">
+            <div>
+            <div class="main-title-row">
                 <h2>${anime.title}</h2>
-                <button class="btn-back" id="back-btn">← Voltar</button>
-            </div>
+            <button class="alt-title-btn copy-title-btn" id="copy-main-title" title="Copiar título">📋</button>
+        </div>
+        <div class="alt-titles" id="alt-titles"></div>
+    </div>
+    <button class="btn-back" id="back-btn">← Voltar</button>
+    </div>
         </div>
         <div class="detail-body">
             <div class="detail-info">
@@ -492,6 +540,37 @@ function renderDetail(anime) {
             <div class="detail-sidebar"></div>
         </div>
     `;
+
+    const mainTitleToCopy = anime.title_english || anime.title;
+    const copyMainBtn = document.getElementById('copy-main-title');
+if (copyMainBtn) {
+    copyMainBtn.onclick = () => {
+        navigator.clipboard.writeText(mainTitleToCopy);
+        copyMainBtn.innerText = '✅';
+        setTimeout(() => copyMainBtn.innerText = '📋', 1200);
+    };
+}
+
+    const altTitlesContainer = document.getElementById('alt-titles');
+if (altTitlesContainer) {
+    const showRomaji = anime.title_romaji && anime.title_romaji !== anime.title;
+    if (showRomaji) {
+        altTitlesContainer.innerHTML = `
+            <div class="alt-title-item">
+                <span class="alt-title-label">Romaji:</span>
+                <span class="alt-title-text">${anime.title_romaji}</span>
+                <button class="alt-title-btn copy-title-btn" id="copy-romaji-title" title="Copiar">📋</button>
+            </div>
+        `;
+        document.getElementById('copy-romaji-title').onclick = (e) => {
+            navigator.clipboard.writeText(anime.title_romaji);
+            e.target.innerText = '✅';
+            setTimeout(() => e.target.innerText = '📋', 1200);
+        };
+    } else {
+        altTitlesContainer.innerHTML = '';
+    }
+}
 
     const readMoreBtn = document.getElementById('read-more-btn');
     const synopsisText = document.getElementById('synopsis-text');
@@ -602,6 +681,181 @@ async function deleteAnime(id_db) {
     ]);
 }
 
+// ---------- MIGRAÇÃO (rodar manualmente no console quando precisar) ----------
+
+async function migrateOldSynopses() {
+    const { data, error } = await supabaseClient
+        .from('animes')
+        .select('id, title, synopsis, synopsis_lang')
+        .not('synopsis', 'is', null)
+        .neq('synopsis_lang', 'pt');
+
+    if (error) { console.error('Erro ao buscar animes para migração:', error); return; }
+    if (!data || data.length === 0) { console.log('Nada para traduzir. Todos já estão em PT-BR.'); return; }
+
+    console.log(`Iniciando tradução de ${data.length} anime(s)...`);
+    let sucesso = 0, falha = 0;
+
+    for (const anime of data) {
+        const result = await translateToPtBr(anime.synopsis);
+        if (result.success) {
+            await supabaseClient
+                .from('animes')
+                .update({ synopsis: result.text, synopsis_lang: 'pt' })
+                .eq('id', anime.id);
+            console.log(`✅ Traduzido: ${anime.title}`);
+            sucesso++;
+        } else {
+            console.warn(`❌ Falhou: ${anime.title}`);
+            falha++;
+        }
+        await new Promise(r => setTimeout(r, 500));
+    }
+
+    console.log(`Migração concluída. Sucesso: ${sucesso} | Falhas: ${falha}`);
+    await loadList();
+    renderGrid(document.querySelector('.filter-btn.active').dataset.filter, '');
+}
+
+async function migrateOldTitles() {
+    const { data: animes, error } = await supabaseClient
+        .from('animes')
+        .select('id, title, mal_id, title_english, title_romaji');
+
+    if (error) { console.error('Erro ao buscar animes:', error); return; }
+    if (!animes || animes.length === 0) { console.log('Nenhum anime encontrado.'); return; }
+
+    console.log(`Verificando títulos de ${animes.length} anime(s)...`);
+    let apiChamadas = 0, sucesso = 0, falha = 0, idsCorrigidos = 0, titulosCorrigidos = 0, semAlteracao = 0;
+    const naoEncontrados = [];
+
+    const gqlById = `
+        query ($id: Int) {
+            Media(id: $id, type: ANIME) {
+                id
+                title { english romaji }
+            }
+        }
+    `;
+    const gqlBySearch = `
+        query ($search: String) {
+            Page(perPage: 5) {
+                media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
+                    id
+                    title { english romaji }
+                }
+            }
+        }
+    `;
+
+    for (const anime of animes) {
+        try {
+            const updateFields = {};
+            let englishTitle = anime.title_english;
+            let romajiTitle = anime.title_romaji;
+
+            // Só chama a AniList se ainda não temos o romaji salvo (ou seja, nunca foi buscado antes)
+            const precisaBuscarNaAniList = romajiTitle === null || romajiTitle === undefined;
+
+            if (precisaBuscarNaAniList) {
+                apiChamadas++;
+                let media = null;
+                const anilistId = parseInt(anime.mal_id);
+
+                // 1ª tentativa: busca direta pelo ID salvo
+                if (!isNaN(anilistId)) {
+                    try {
+                        const mediaData = await queryAniList(gqlById, { id: anilistId });
+                        media = mediaData?.Media || null;
+                    } catch (e) {
+                        if (e.code !== 'NOT_FOUND') throw e;
+                        media = null; // ID legado do Jikan/MAL, não existe na AniList
+                    }
+                }
+
+                // 2ª tentativa (fallback): busca por título
+                let idCorrigido = null;
+                if (!media) {
+                    const searchData = await queryAniList(gqlBySearch, { search: anime.title });
+                    const candidato = searchData?.Page?.media?.[0] || null;
+                    if (candidato) {
+                        media = candidato;
+                        idCorrigido = candidato.id;
+                    }
+                }
+
+                if (!media) throw new Error('Não encontrado na AniList (nem por ID, nem por título)');
+
+                englishTitle = media.title?.english || null;
+                romajiTitle = media.title?.romaji || null;
+                updateFields.title_english = englishTitle;
+                updateFields.title_romaji = romajiTitle;
+
+                if (idCorrigido && idCorrigido !== anilistId) {
+                    updateFields.mal_id = idCorrigido;
+                    idsCorrigidos++;
+                }
+                sucesso++;
+            }
+
+            // Sempre garante que o título principal exibido seja o melhor disponível (inglês > romaji)
+            const bestTitle = englishTitle || romajiTitle || anime.title;
+            if (bestTitle !== anime.title) {
+                updateFields.title = bestTitle;
+                titulosCorrigidos++;
+            }
+
+            if (Object.keys(updateFields).length > 0) {
+                await supabaseClient.from('animes').update(updateFields).eq('id', anime.id);
+                const tag = updateFields.title ? ` → "${updateFields.title}"` : '';
+                const idTag = updateFields.mal_id ? ` (ID: ${anime.mal_id} → ${updateFields.mal_id})` : '';
+                console.log(`✅ ${anime.title}${tag}${idTag}`);
+            } else {
+                semAlteracao++;
+            }
+        } catch (e) {
+            console.warn(`❌ Falhou: ${anime.title}`, e.message);
+            naoEncontrados.push(anime.title);
+            falha++;
+        }
+    }
+
+    console.log(`Migração concluída. Chamadas à API: ${apiChamadas} | Sucesso: ${sucesso} | Falhas: ${falha} | Títulos corrigidos: ${titulosCorrigidos} | IDs corrigidos: ${idsCorrigidos} | Sem alteração: ${semAlteracao}`);
+    if (naoEncontrados.length) console.log('Não encontrados (revisar manualmente):', naoEncontrados);
+    await loadList();
+    renderGrid(document.querySelector('.filter-btn.active').dataset.filter, '');
+}
+
+async function fixMainTitles() {
+    const { data, error } = await supabaseClient
+        .from('animes')
+        .select('id, title, title_english, title_romaji');
+
+    if (error) { console.error('Erro ao buscar animes:', error); return; }
+    if (!data || data.length === 0) { console.log('Nenhum anime encontrado.'); return; }
+
+    console.log(`Verificando título principal de ${data.length} anime(s)...`);
+    let corrigidos = 0, ignorados = 0;
+
+    for (const anime of data) {
+        const bestTitle = anime.title_english || anime.title_romaji || anime.title;
+        if (bestTitle && bestTitle !== anime.title) {
+            await supabaseClient
+                .from('animes')
+                .update({ title: bestTitle })
+                .eq('id', anime.id);
+            console.log(`✅ Corrigido: "${anime.title}" → "${bestTitle}"`);
+            corrigidos++;
+        } else {
+            ignorados++;
+        }
+    }
+
+    console.log(`Correção concluída. Corrigidos: ${corrigidos} | Já estavam corretos: ${ignorados}`);
+    await loadList();
+    renderGrid(document.querySelector('.filter-btn.active').dataset.filter, '');
+}
+
 // ---------- EVENTOS ----------
 
 searchBtn.addEventListener('click', () => {
@@ -623,6 +877,13 @@ clearBtn.addEventListener('click', () => {
     renderGrid(document.querySelector('.filter-btn.active').dataset.filter, '');
 });
 
+document.addEventListener('click', (e) => {
+    const isClickInsideSearch = searchInput.contains(e.target) || searchResults.contains(e.target) || searchBtn.contains(e.target);
+    if (!isClickInsideSearch) {
+        searchResults.style.display = 'none';
+    }
+});
+
 searchInput.addEventListener('input', () => {
     const q = searchInput.value.trim();
     clearBtn.style.display = q.length ? 'flex' : 'none';
@@ -630,6 +891,13 @@ searchInput.addEventListener('input', () => {
     renderGrid(activeFilter, q);
     clearTimeout(searchTimeout);
     searchTimeout = setTimeout(fetchSuggestions, 400);
+});
+
+searchInput.addEventListener('focus', () => {
+    const q = searchInput.value.trim();
+    if (q.length >= 3 && searchResults.innerHTML.trim() !== '') {
+        searchResults.style.display = 'block';
+    }
 });
 
 closeModal.addEventListener('click', UI.hideModal);

@@ -140,6 +140,60 @@ header {
     box-shadow: 0 10px 30px rgba(0,0,0,0.5);
 }
 
+.alt-titles {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 10px;
+}
+
+.alt-title-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+}
+
+.alt-title-label {
+    font-weight: 600;
+    color: var(--accent-color);
+    min-width: 50px;
+}
+
+.alt-title-text {
+    color: var(--text-main);
+    max-width: 300px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.alt-title-btn {
+    background: var(--glass);
+    border: none;
+    color: var(--text-main);
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: var(--transition);
+}
+
+.alt-title-btn:hover {
+    background: var(--accent-color);
+}
+
+.main-title-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
 /* Custom Scrollbar for Search Results */
 .search-results::-webkit-scrollbar {
     width: 6px;
@@ -874,5 +928,8 @@ header {
     }
     .stat-item {
         font-size: 0.68rem;
+    }
+    .alt-title-text {
+        max-width: 150px;
     }
 }
