@@ -101,9 +101,15 @@ async function performAniListRequest(query, variables, retriesLeft = 3) {
     }
 }
 
-function getBestTitle(titleObj) {
-    if (!titleObj) return 'Título Indisponível';
-    return titleObj.english || titleObj.romaji || 'Título Indisponível';
+function getBestTitle(titleObj, synonyms = []) {
+    if (titleObj?.english) return titleObj.english;
+    if (Array.isArray(synonyms) && synonyms.length > 0 && synonyms[0]) return synonyms[0];
+    if (titleObj?.romaji) return titleObj.romaji;
+    return 'Título Indisponível';
+}
+
+function getBestYear(media) {
+    return media?.seasonYear || media?.startDate?.year || null;
 }
 
 function cleanDescription(desc) {
@@ -182,6 +188,7 @@ async function refreshLiveAniListData() {
                     id
                     episodes
                     seasonYear
+                    startDate { year }
                     nextAiringEpisode { airingAt episode }
                 }
             }
@@ -204,8 +211,9 @@ async function refreshLiveAniListData() {
                     if ((!dbAnime.total_ep || dbAnime.total_ep === 0) && m.episodes) {
                         fields.total_ep = m.episodes;
                     }
-                    if (!dbAnime.year && m.seasonYear) {
-                        fields.year = m.seasonYear;
+                    if (!dbAnime.year) {
+                        const bestYear = getBestYear(m);
+                        if (bestYear) fields.year = bestYear;
                     }
                     if (Object.keys(fields).length > 0) {
                         await updateAnimeFields(dbAnime.id, fields);
@@ -478,8 +486,10 @@ async function fetchSuggestions() {
                 media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
                     id
                     title { english romaji }
+                    synonyms
                     coverImage { large }
                     seasonYear
+                    startDate { year }
                     episodes
                     genres
                     description
@@ -487,6 +497,7 @@ async function fetchSuggestions() {
             }
         }
     `;
+    
     try {
         const data = await queryAniList(gqlQuery, { search: query });
         if (requestId !== searchRequestId) return; // busca mais nova já foi disparada, ignora esta resposta
@@ -506,7 +517,7 @@ function renderSuggestions(animes) {
     searchResults.innerHTML = '';
     searchResults.style.display = 'block';
     animes.forEach(anime => {
-        const title = getBestTitle(anime.title);
+        const title = getBestTitle(anime.title, anime.synonyms);
         const imgUrl = anime.coverImage?.large || 'https://via.placeholder.com/40x60?text=No+Img';
         const item = document.createElement('div');
         item.className = 'result-item';
@@ -528,7 +539,7 @@ function renderSuggestions(animes) {
 function showStatusPicker() {
     const anime = currentSelectedAnime;
     UI.showModal('Definir Status', `
-        <p style="margin-bottom:15px;">Em qual categoria deseja adicionar <strong>${getBestTitle(anime.title)}</strong>?</p>
+        <p style="margin-bottom:15px;">Em qual categoria deseja adicionar <strong>${getBestTitle(anime.title, anime.synonyms)}</strong>?</p>
         <div style="display:grid;gap:10px;">
             <button class="btn-modal btn-cancel status-opt" data-status="watching">🔵 Assistindo</button>
             <button class="btn-modal btn-cancel status-opt" data-status="completed">✅ Concluído</button>
@@ -548,11 +559,11 @@ async function finalizeAdd(status) {
 
     const newAnime = {
         mal_id: anime.id,
-        title: getBestTitle(anime.title),
-        title_english: anime.title?.english || null,
+        title: getBestTitle(anime.title, anime.synonyms),
+        title_english: anime.title?.english || (anime.synonyms?.[0] || null),
         title_romaji: anime.title?.romaji || null,
         cover_url: anime.coverImage?.large,
-        year: anime.seasonYear || null,
+        year: getBestYear(anime),
         total_ep: totalEp,
         status: status,
         current_ep: status === 'completed' ? totalEp : 0,
@@ -687,10 +698,12 @@ async function showDetail(id_db) {
             query ($id: Int) {
                 Media(id: $id, type: ANIME) {
                     title { english romaji }
+                    synonyms
                     description
                     genres
                     episodes
                     seasonYear
+                    startDate { year }
                     coverImage { large }
                 }
             }
@@ -702,16 +715,19 @@ async function showDetail(id_db) {
         const rawSynopsis = cleanDescription(m.description);
         const translationResult = await translateToPtBr(rawSynopsis);
 
+        const bestEnglish = m.title?.english || (m.synonyms?.[0] || null);
         const updatedFields = {
             synopsis: translationResult.text,
             synopsis_lang: translationResult.success ? 'pt' : 'en',
             genres: m.genres || [],
             total_ep: m.episodes || 0,
-            year: m.seasonYear || null,
+            year: getBestYear(m),
             cover_url: anime.cover_url || m.coverImage?.large,
-            title_english: m.title?.english || null,
-            title_romaji: m.title?.romaji || null
+            title_english: bestEnglish,
+            title_romaji: m.title?.romaji || null,
+            title: bestEnglish || m.title?.romaji || anime.title
         };
+
         await updateAnimeFields(id_db, updatedFields);
         Object.assign(anime, updatedFields);
         UI.hideModal();
@@ -964,12 +980,12 @@ async function migrateOldSynopses() {
 async function migrateOldTitles() {
     const { data: animes, error } = await supabaseClient
         .from('animes')
-        .select('id, title, mal_id, title_english, title_romaji');
+        .select('id, title, mal_id, title_english, title_romaji, year, total_ep');
 
     if (error) { console.error('Erro ao buscar animes:', error); return; }
     if (!animes || animes.length === 0) { console.log('Nenhum anime encontrado.'); return; }
 
-    console.log(`Verificando títulos de ${animes.length} anime(s)...`);
+    console.log(`Verificando dados de ${animes.length} anime(s)...`);
     let apiChamadas = 0, sucesso = 0, falha = 0, idsCorrigidos = 0, titulosCorrigidos = 0, semAlteracao = 0;
     const naoEncontrados = [];
 
@@ -978,6 +994,10 @@ async function migrateOldTitles() {
             Media(id: $id, type: ANIME) {
                 id
                 title { english romaji }
+                synonyms
+                episodes
+                seasonYear
+                startDate { year }
             }
         }
     `;
@@ -987,6 +1007,10 @@ async function migrateOldTitles() {
                 media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
                     id
                     title { english romaji }
+                    synonyms
+                    episodes
+                    seasonYear
+                    startDate { year }
                 }
             }
         }
@@ -998,26 +1022,27 @@ async function migrateOldTitles() {
             let englishTitle = anime.title_english;
             let romajiTitle = anime.title_romaji;
 
-            // Só chama a AniList se ainda não temos o romaji salvo (ou seja, nunca foi buscado antes)
-            const precisaBuscarNaAniList = romajiTitle === null || romajiTitle === undefined;
+            // Precisa buscar na AniList se faltar romaji, faltar inglês (pode ter synonym), ano ou episódios
+            const precisaBuscarNaAniList =
+                romajiTitle === null || romajiTitle === undefined ||
+                englishTitle === null || englishTitle === undefined ||
+                !anime.year || !anime.total_ep;
 
             if (precisaBuscarNaAniList) {
                 apiChamadas++;
                 let media = null;
                 const anilistId = parseInt(anime.mal_id);
 
-                // 1ª tentativa: busca direta pelo ID salvo
                 if (!isNaN(anilistId)) {
                     try {
                         const mediaData = await queryAniList(gqlById, { id: anilistId });
                         media = mediaData?.Media || null;
                     } catch (e) {
                         if (e.code !== 'NOT_FOUND') throw e;
-                        media = null; // ID legado do Jikan/MAL, não existe na AniList
+                        media = null;
                     }
                 }
 
-                // 2ª tentativa (fallback): busca por título
                 let idCorrigido = null;
                 if (!media) {
                     const searchData = await queryAniList(gqlBySearch, { search: anime.title });
@@ -1030,10 +1055,19 @@ async function migrateOldTitles() {
 
                 if (!media) throw new Error('Não encontrado na AniList (nem por ID, nem por título)');
 
-                englishTitle = media.title?.english || null;
-                romajiTitle = media.title?.romaji || null;
+                romajiTitle = media.title?.romaji || romajiTitle || null;
+                englishTitle = media.title?.english || media.synonyms?.[0] || null;
+
                 updateFields.title_english = englishTitle;
                 updateFields.title_romaji = romajiTitle;
+
+                if (!anime.year) {
+                    const bestYear = getBestYear(media);
+                    if (bestYear) updateFields.year = bestYear;
+                }
+                if (!anime.total_ep && media.episodes) {
+                    updateFields.total_ep = media.episodes;
+                }
 
                 if (idCorrigido && idCorrigido !== anilistId) {
                     updateFields.mal_id = idCorrigido;
@@ -1042,7 +1076,6 @@ async function migrateOldTitles() {
                 sucesso++;
             }
 
-            // Sempre garante que o título principal exibido seja o melhor disponível (inglês > romaji)
             const bestTitle = englishTitle || romajiTitle || anime.title;
             if (bestTitle !== anime.title) {
                 updateFields.title = bestTitle;
