@@ -119,40 +119,6 @@ function splitTextForTranslation(text, maxLen = 1500) {
     return chunks;
 }
 
-function xhrRequest(url, timeoutMs = 8000) {
-    return new Promise((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        xhr.open('GET', url, true);
-        xhr.timeout = timeoutMs;
-        xhr.onload = () => {
-            if (xhr.status >= 200 && xhr.status < 300) {
-                resolve(xhr.responseText);
-            } else {
-                reject(new Error(`Tradução falhou: ${xhr.status}`));
-            }
-        };
-        xhr.onerror = () => reject(new Error('Falha de rede (XHR) ao traduzir.'));
-        xhr.ontimeout = () => reject(new Error('Tradução demorou demais (timeout XHR).'));
-        xhr.send();
-    });
-}
-
-async function fetchWithRetry(url, maxRetries = 2, retryDelayMs = 600) {
-    let lastError;
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        try {
-            const responseText = await xhrRequest(url);
-            return { text: () => Promise.resolve(responseText), json: () => Promise.resolve(JSON.parse(responseText)) };
-        } catch (e) {
-            lastError = e;
-            if (attempt < maxRetries) {
-                await new Promise(r => setTimeout(r, retryDelayMs * (attempt + 1)));
-            }
-        }
-    }
-    throw lastError;
-}
-
 async function translateToPtBr(text) {
     if (!text) return { text, success: false };
     try {
@@ -160,7 +126,8 @@ async function translateToPtBr(text) {
         const translatedParts = [];
         for (const chunk of chunks) {
             const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=pt&dt=t&q=${encodeURIComponent(chunk)}`;
-            const resp = await fetchWithRetry(url);
+            const resp = await fetch(url);
+            if (!resp.ok) throw new Error(`Tradução falhou: ${resp.status}`);
             const data = await resp.json();
             const translated = data[0].map(part => part[0]).join('');
             translatedParts.push(translated);
