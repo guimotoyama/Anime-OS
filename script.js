@@ -119,16 +119,30 @@ function splitTextForTranslation(text, maxLen = 1500) {
     return chunks;
 }
 
+function xhrRequest(url, timeoutMs = 8000) {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url, true);
+        xhr.timeout = timeoutMs;
+        xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+                resolve(xhr.responseText);
+            } else {
+                reject(new Error(`Tradução falhou: ${xhr.status}`));
+            }
+        };
+        xhr.onerror = () => reject(new Error('Falha de rede (XHR) ao traduzir.'));
+        xhr.ontimeout = () => reject(new Error('Tradução demorou demais (timeout XHR).'));
+        xhr.send();
+    });
+}
+
 async function fetchWithRetry(url, maxRetries = 2, retryDelayMs = 600) {
     let lastError;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 8000);
-            const resp = await fetch(url, { signal: controller.signal });
-            clearTimeout(timeoutId);
-            if (!resp.ok) throw new Error(`Tradução falhou: ${resp.status}`);
-            return resp;
+            const responseText = await xhrRequest(url);
+            return { text: () => Promise.resolve(responseText), json: () => Promise.resolve(JSON.parse(responseText)) };
         } catch (e) {
             lastError = e;
             if (attempt < maxRetries) {
@@ -154,7 +168,7 @@ async function translateToPtBr(text) {
         return { text: translatedParts.join(' '), success: true };
     } catch (e) {
         console.warn('Falha ao traduzir, mantendo texto original em inglês:', e.message);
-        UI.showToast(`[DEBUG] Erro tradução: ${e.message}`, 'error', 10000); // TEMPORÁRIO - remover após diagnóstico
+        UI.showToast(`[DEBUG] Erro tradução: ${e.message}`, 'error', 5000);
         return { text, success: false };
     }
 }
