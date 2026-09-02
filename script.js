@@ -119,6 +119,26 @@ function splitTextForTranslation(text, maxLen = 1500) {
     return chunks;
 }
 
+async function fetchWithRetry(url, maxRetries = 2, retryDelayMs = 600) {
+    let lastError;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 8000);
+            const resp = await fetch(url, { signal: controller.signal });
+            clearTimeout(timeoutId);
+            if (!resp.ok) throw new Error(`Tradução falhou: ${resp.status}`);
+            return resp;
+        } catch (e) {
+            lastError = e;
+            if (attempt < maxRetries) {
+                await new Promise(r => setTimeout(r, retryDelayMs * (attempt + 1)));
+            }
+        }
+    }
+    throw lastError;
+}
+
 async function translateToPtBr(text) {
     if (!text) return { text, success: false };
     try {
@@ -126,8 +146,7 @@ async function translateToPtBr(text) {
         const translatedParts = [];
         for (const chunk of chunks) {
             const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=pt&dt=t&q=${encodeURIComponent(chunk)}`;
-            const resp = await fetch(url);
-            if (!resp.ok) throw new Error(`Tradução falhou: ${resp.status}`);
+            const resp = await fetchWithRetry(url);
             const data = await resp.json();
             const translated = data[0].map(part => part[0]).join('');
             translatedParts.push(translated);
