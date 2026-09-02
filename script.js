@@ -14,9 +14,7 @@ let focusedCardIndex = -1; // índice do card atualmente destacado via teclado
 const aniListLimiter = {
     queue: [],
     processing: false,
-    remaining: 30,
-    resetAt: 0,
-    minGapMs: 2000, // AniList está em modo: 30 req/min = 1 a cada 2 segundos
+    minGapMs: 2000, // AniList está em modo degradado: 30 req/min = 1 a cada 2 segundos
 
     schedule(job) {
         return new Promise((resolve, reject) => {
@@ -29,10 +27,6 @@ const aniListLimiter = {
         if (this.processing) return;
         this.processing = true;
         while (this.queue.length) {
-            const now = Date.now();
-            if (this.remaining <= 1 && this.resetAt > now) {
-                await new Promise(r => setTimeout(r, this.resetAt - now + 300));
-            }
             const { job, resolve, reject } = this.queue.shift();
             try {
                 resolve(await job());
@@ -42,21 +36,10 @@ const aniListLimiter = {
             await new Promise(r => setTimeout(r, this.minGapMs));
         }
         this.processing = false;
-    },
-
-    updateFromHeaders(headers) {
-        const rem = headers.get('x-ratelimit-remaining');
-        const reset = headers.get('x-ratelimit-reset');
-        if (rem !== null && !isNaN(parseInt(rem))) this.remaining = parseInt(rem, 10);
-        if (reset !== null && !isNaN(parseInt(reset))) this.resetAt = parseInt(reset, 10) * 1000;
     }
 };
 
-async function queryAniList(query, variables = {}) {
-    return aniListLimiter.schedule(() => performAniListRequest(query, variables));
-}
-
-async function performAniListRequest(query, variables, retriesLeft = 3) {
+async function performAniListRequest(query, variables, retriesLeft = 3, attempt = 0) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000);
     try {
@@ -67,15 +50,14 @@ async function performAniListRequest(query, variables, retriesLeft = 3) {
             signal: controller.signal
         });
         clearTimeout(timeoutId);
-        aniListLimiter.updateFromHeaders(response.headers);
 
         if (response.status === 429) {
             if (retriesLeft <= 0) throw new Error('Limite da AniList excedido. Tente novamente em breve.');
-            const retryAfter = parseInt(response.headers.get('Retry-After') || '5', 10);
-            aniListLimiter.remaining = 0;
-            aniListLimiter.resetAt = Date.now() + retryAfter * 1000;
-            await new Promise(r => setTimeout(r, retryAfter * 1000 + 300));
-            return performAniListRequest(query, variables, retriesLeft - 1);
+            // Tenta ler o header Retry-After. Se o navegador bloquear via CORS (comum), cai no backoff exponencial.
+            const headerRetry = parseInt(response.headers.get('Retry-After') || '', 10);
+            const backoffMs = !isNaN(headerRetry) ? headerRetry * 1000 : Math.min(3000 * Math.pow(2, attempt), 30000);
+            await new Promise(r => setTimeout(r, backoffMs + 300));
+            return performAniListRequest(query, variables, retriesLeft - 1, attempt + 1);
         }
 
         if (response.status === 404) {
@@ -86,7 +68,7 @@ async function performAniListRequest(query, variables, retriesLeft = 3) {
 
         if (response.status >= 500 && retriesLeft > 0) {
             await new Promise(r => setTimeout(r, 1200));
-            return performAniListRequest(query, variables, retriesLeft - 1);
+            return performAniListRequest(query, variables, retriesLeft - 1, attempt + 1);
         }
 
         if (!response.ok) throw new Error(`Erro na AniList: ${response.status}`);
@@ -99,6 +81,10 @@ async function performAniListRequest(query, variables, retriesLeft = 3) {
         if (e.name === 'AbortError') throw new Error('A busca demorou demais para responder. Tente novamente.');
         throw e;
     }
+}
+
+async function queryAniList(query, variables = {}) {
+    return aniListLimiter.schedule(() => performAniListRequest(query, variables));
 }
 
 function getBestTitle(titleObj, synonyms = []) {
@@ -149,6 +135,7 @@ async function translateToPtBr(text) {
         return { text: translatedParts.join(' '), success: true };
     } catch (e) {
         console.warn('Falha ao traduzir, mantendo texto original em inglês:', e.message);
+        UI.showToast(`[DEBUG] Erro tradução: ${e.message}`, 'error', 10000); // TEMPORÁRIO - remover após diagnóstico
         return { text, success: false };
     }
 }
@@ -864,11 +851,15 @@ if (altTitlesContainer) {
                     <button class="prog-btn" id="inc-ep">+</button>
                 </div>
             `;
+
             document.getElementById('inc-ep').onclick = async () => {
-                anime.current_ep = (typeof anime.current_ep === 'number') ? anime.current_ep + 1 : 1;
+                const nextEp = (typeof anime.current_ep === 'number') ? anime.current_ep + 1 : 1;
+                if (!isNaN(totalEps) && totalEps > 0 && nextEp > totalEps) return;
+                anime.current_ep = nextEp;
                 await updateAnimeFields(anime.id, { current_ep: anime.current_ep });
                 updateUI();
             };
+
             document.getElementById('dec-ep').onclick = async () => {
                 if (typeof anime.current_ep === 'number' && anime.current_ep > 0) {
                     anime.current_ep--;
@@ -1103,36 +1094,6 @@ async function migrateOldTitles() {
     renderGrid(document.querySelector('.filter-btn.active').dataset.filter, '');
 }
 
-async function fixMainTitles() {
-    const { data, error } = await supabaseClient
-        .from('animes')
-        .select('id, title, title_english, title_romaji');
-
-    if (error) { console.error('Erro ao buscar animes:', error); return; }
-    if (!data || data.length === 0) { console.log('Nenhum anime encontrado.'); return; }
-
-    console.log(`Verificando título principal de ${data.length} anime(s)...`);
-    let corrigidos = 0, ignorados = 0;
-
-    for (const anime of data) {
-        const bestTitle = anime.title_english || anime.title_romaji || anime.title;
-        if (bestTitle && bestTitle !== anime.title) {
-            await supabaseClient
-                .from('animes')
-                .update({ title: bestTitle })
-                .eq('id', anime.id);
-            console.log(`✅ Corrigido: "${anime.title}" → "${bestTitle}"`);
-            corrigidos++;
-        } else {
-            ignorados++;
-        }
-    }
-
-    console.log(`Correção concluída. Corrigidos: ${corrigidos} | Já estavam corretos: ${ignorados}`);
-    await loadList();
-    renderGrid(document.querySelector('.filter-btn.active').dataset.filter, '');
-}
-
 // ---------- EVENTOS ----------
 
 searchBtn.addEventListener('click', () => {
@@ -1151,6 +1112,7 @@ clearBtn.addEventListener('click', () => {
     searchInput.value = '';
     clearBtn.style.display = 'none';
     searchResults.style.display = 'none';
+    searchRequestId++;
     renderGrid(document.querySelector('.filter-btn.active').dataset.filter, '');
 });
 
@@ -1168,7 +1130,7 @@ searchInput.addEventListener('input', () => {
     renderGrid(activeFilter, q);
     clearTimeout(searchTimeout);
 
-    if (q.length < 3) { searchResults.style.display = 'none'; return; }
+    if (q.length < 3) { searchRequestId++; searchResults.style.display = 'none'; return; }
 
     // Se já temos cache pra esse termo, mostra na hora, sem esperar o debounce
     const cached = getSearchCache(normalizeSearchQuery(q));

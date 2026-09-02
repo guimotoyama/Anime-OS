@@ -1,11 +1,11 @@
-const CACHE_VERSION = 'v2.5';
+const CACHE_VERSION = 'v2.6';
 const CACHE_NAME = `anime-os-cache-${CACHE_VERSION}`;
 const ASSETS = [
   './',
   './index.html',
   './style.css',
   './script.js',
-  './imagens/Logo.svg'
+  './imagens/logo.svg'
 ];
 
 self.addEventListener('install', (event) => {
