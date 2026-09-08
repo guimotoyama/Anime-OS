@@ -10,11 +10,54 @@ let searchTimeout = null;
 let nextEpisodeCache = {};
 let searchRequestId = 0; // usado para ignorar respostas de buscas antigas/obsoletas
 let focusedCardIndex = -1; // índice do card atualmente destacado via teclado
+let sortReversed = false;
+
+const STATUS_CONFIG = {
+    watching:  { label: 'Assistindo', emoji: '🔵', badgeClass: 'badge-watching',  key: '1' },
+    completed: { label: 'Concluído',  emoji: '✅', badgeClass: 'badge-completed', key: '2' },
+    planned:   { label: 'Planejado',  emoji: '⏳', badgeClass: 'badge-planned',   key: '3' }
+};
 
 const aniListLimiter = {
-    queue: [],
+    priorityQueue: [],   // ações do usuário: busca, abrir detalhes
+    backgroundQueue: [], // tarefas automáticas: refreshLiveAniListData, migrações
     processing: false,
     minGapMs: 2000, // AniList está em modo degradado: 30 req/min = 1 a cada 2 segundos
+
+    schedule(job, options = {}) {
+        return new Promise((resolve, reject) => {
+            const task = { job, resolve, reject };
+            if (options.priority) {
+                this.priorityQueue.push(task);
+            } else {
+                this.backgroundQueue.push(task);
+            }
+            this._run();
+        });
+    },
+
+    async _run() {
+        if (this.processing) return;
+        this.processing = true;
+        while (this.priorityQueue.length || this.backgroundQueue.length) {
+            // Sempre prioriza ações do usuário sobre tarefas de fundo
+            const queue = this.priorityQueue.length ? this.priorityQueue : this.backgroundQueue;
+            const { job, resolve, reject } = queue.shift();
+            try {
+                resolve(await job());
+            } catch (e) {
+                reject(e);
+            }
+            await new Promise(r => setTimeout(r, this.minGapMs));
+        }
+        this.processing = false;
+    }
+};
+
+const translateLimiter = {
+    queue: [],
+    processing: false,
+    minGapMs: 600, // pausa mínima entre traduções, pra evitar rajadas
 
     schedule(job) {
         return new Promise((resolve, reject) => {
@@ -83,8 +126,8 @@ async function performAniListRequest(query, variables, retriesLeft = 3, attempt 
     }
 }
 
-async function queryAniList(query, variables = {}) {
-    return aniListLimiter.schedule(() => performAniListRequest(query, variables));
+async function queryAniList(query, variables = {}, options = {}) {
+    return aniListLimiter.schedule(() => performAniListRequest(query, variables), options);
 }
 
 function getBestTitle(titleObj, synonyms = []) {
@@ -102,7 +145,17 @@ function cleanDescription(desc) {
     return desc ? desc.replace(/<[^>]*>?/gm, '') : null;
 }
 
-function splitTextForTranslation(text, maxLen = 1500) {
+function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function splitTextForTranslation(text, maxLen = 450) { // MyMemory aceita ~500 caracteres por chamada
     if (text.length <= maxLen) return [text];
     const sentences = text.match(/[^.!?]+[.!?]+|\S+$/g) || [text];
     const chunks = [];
@@ -119,23 +172,50 @@ function splitTextForTranslation(text, maxLen = 1500) {
     return chunks;
 }
 
+async function translateChunk(chunk, retriesLeft = 3, attempt = 0) {
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(chunk)}&langpair=en|pt-BR&de=guimotoyama1@gmail.com`;
+    try {
+        const resp = await fetch(url);
+
+        if (resp.status === 429) {
+            if (retriesLeft <= 0) throw new Error('Limite de tradução excedido. Tente novamente mais tarde.');
+            const backoffMs = Math.min(1000 * Math.pow(2, attempt), 8000);
+            await new Promise(r => setTimeout(r, backoffMs));
+            return translateChunk(chunk, retriesLeft - 1, attempt + 1);
+        }
+
+        if (!resp.ok) throw new Error(`Tradução falhou: ${resp.status}`);
+
+        const data = await resp.json();
+
+        // A MyMemory às vezes responde 200 OK mas com um aviso de cota
+        // esgotada dentro do próprio texto traduzido, em vez de um status de erro.
+        const translated = data?.responseData?.translatedText || '';
+        if (data.responseStatus !== 200 || translated.includes('MYMEMORY WARNING')) {
+            throw new Error(data.responseDetails || 'Cota diária de tradução esgotada.');
+        }
+
+        return translated;
+    } catch (e) {
+        if (retriesLeft <= 0) throw e;
+        const backoffMs = Math.min(1000 * Math.pow(2, attempt), 8000);
+        await new Promise(r => setTimeout(r, backoffMs));
+        return translateChunk(chunk, retriesLeft - 1, attempt + 1);
+    }
+}
+
 async function translateToPtBr(text) {
     if (!text) return { text, success: false };
     try {
         const chunks = splitTextForTranslation(text);
         const translatedParts = [];
         for (const chunk of chunks) {
-            const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=pt&dt=t&q=${encodeURIComponent(chunk)}`;
-            const resp = await fetch(url);
-            if (!resp.ok) throw new Error(`Tradução falhou: ${resp.status}`);
-            const data = await resp.json();
-            const translated = data[0].map(part => part[0]).join('');
+            const translated = await translateLimiter.schedule(() => translateChunk(chunk));
             translatedParts.push(translated);
         }
         return { text: translatedParts.join(' '), success: true };
     } catch (e) {
         console.warn('Falha ao traduzir, mantendo texto original em inglês:', e.message);
-        UI.showToast(`[DEBUG] Erro tradução: ${e.message}`, 'error', 5000);
         return { text, success: false };
     }
 }
@@ -154,11 +234,39 @@ function formatAiringCountdown(airingAtUnix) {
     return `em ${minutes}min`;
 }
 
+let countdownTickerStarted = false;
+
+function updateCountdownDisplays() {
+    // Cards do grid
+    document.querySelectorAll('.next-ep-info[data-mal-id]').forEach(el => {
+        const nextEp = nextEpisodeCache[parseInt(el.dataset.malId)];
+        if (nextEp) el.textContent = `🕐 Ep ${nextEp.episode} ${formatAiringCountdown(nextEp.airingAt)}`;
+    });
+
+    // Tela de detalhes (se estiver aberta e tiver o campo)
+    const detailEl = document.getElementById('detail-next-ep-value');
+    if (detailEl) {
+        const nextEp = nextEpisodeCache[parseInt(detailEl.dataset.malId)];
+        if (nextEp) detailEl.textContent = `Ep ${nextEp.episode} • ${formatAiringCountdown(nextEp.airingAt)}`;
+    }
+}
+
+function startCountdownTicker() {
+    if (countdownTickerStarted) return; // evita criar vários intervalos duplicados
+    countdownTickerStarted = true;
+    setInterval(updateCountdownDisplays, 60 * 1000); // a cada 1 minuto
+}
+
 async function refreshLiveAniListData() {
     const candidates = myAnimeList.filter(a =>
-        (a.status === 'watching' || a.status === 'planned') &&
-        !isNaN(parseInt(a.mal_id))
-    );
+    !isNaN(parseInt(a.mal_id)) &&
+    (
+        a.status === 'watching' ||
+        a.status === 'planned' ||
+        !a.total_ep || a.total_ep === 0 // sem episódios definidos ainda -> tenta de novo, não importa o status
+    )
+);
+
     if (candidates.length === 0) return;
 
     const uniqueIds = [...new Set(candidates.map(a => parseInt(a.mal_id)))];
@@ -236,6 +344,7 @@ const closeModal = document.getElementById('modal-close-x');
 const searchResults = document.getElementById('search-results');
 const toastContainer = document.getElementById('toast-container');
 const mainContent = document.getElementById('main-content');
+const sortDirectionBtn = document.getElementById('sort-direction-btn');
 
 function toggleAuthUI(isLoggedIn) {
     authContainer.style.display = isLoggedIn ? 'none' : 'flex';
@@ -357,9 +466,8 @@ async function removeAnime(id_db) {
 // ---------- BUSCA DE NOVOS ANIMES (AniList) ----------
 
 function getStatusLabel(status) {
-    return status === 'watching' ? '🔵 Assistindo'
-        : status === 'completed' ? '✅ Concluído'
-        : '⏳ Planejado';
+    const cfg = STATUS_CONFIG[status];
+    return cfg ? `${cfg.emoji} ${cfg.label}` : status;
 }
 
 function findExistingAnime(anilistId) {
@@ -368,9 +476,9 @@ function findExistingAnime(anilistId) {
 
 function showDuplicateWarning(existingAnime) {
     UI.showModal('Anime já na sua lista', `
-        <p>O anime <strong>${existingAnime.title}</strong> já está cadastrado como:</p>
-        <p style="margin-top:12px;font-size:1.1rem;text-align:center;">${getStatusLabel(existingAnime.status)}</p>
-    `, [
+    <p>O anime <strong>${escapeHtml(existingAnime.title)}</strong> já está cadastrado como:</p>
+    <p style="margin-top:12px;font-size:1.1rem;text-align:center;">${getStatusLabel(existingAnime.status)}</p>
+`, [
         {
             text: 'Ver Anime',
             class: 'btn-confirm',
@@ -404,6 +512,37 @@ function getSearchCache(query) {
     } catch (e) {
         return null;
     }
+}
+
+const NEXT_EP_CACHE_KEY = 'anime_os_next_ep_cache';
+
+function saveNextEpisodeCache() {
+    try {
+        localStorage.setItem(NEXT_EP_CACHE_KEY, JSON.stringify(nextEpisodeCache));
+    } catch (e) {
+        // localStorage indisponível — ignora
+    }
+}
+
+function loadNextEpisodeCache() {
+    try {
+        const raw = localStorage.getItem(NEXT_EP_CACHE_KEY);
+        nextEpisodeCache = raw ? JSON.parse(raw) : {};
+    } catch (e) {
+        nextEpisodeCache = {};
+    }
+}
+
+const LIVE_REFRESH_KEY = 'anime_os_last_refresh';
+const LIVE_REFRESH_INTERVAL = 2 * 60 * 60 * 1000; // 2 horas — ajuste aqui se quiser mais
+
+function shouldRefreshLiveData() {
+    const last = parseInt(localStorage.getItem(LIVE_REFRESH_KEY) || '0', 10);
+    return (Date.now() - last) > LIVE_REFRESH_INTERVAL;
+}
+
+function markLiveDataRefreshed() {
+    localStorage.setItem(LIVE_REFRESH_KEY, Date.now().toString());
 }
 
 function setSearchCache(query, data) {
@@ -486,7 +625,7 @@ async function fetchSuggestions() {
     `;
     
     try {
-        const data = await queryAniList(gqlQuery, { search: query });
+        const data = await queryAniList(gqlQuery, { search: query }, { priority: true });
         if (requestId !== searchRequestId) return; // busca mais nova já foi disparada, ignora esta resposta
 
         const animes = data?.Page?.media || [];
@@ -508,7 +647,7 @@ function renderSuggestions(animes) {
         const imgUrl = anime.coverImage?.large || 'https://via.placeholder.com/40x60?text=No+Img';
         const item = document.createElement('div');
         item.className = 'result-item';
-        item.innerHTML = `<img src="${imgUrl}" alt="${title}"><span class="title">${title}</span>`;
+        item.innerHTML = `<img src="${escapeHtml(imgUrl)}" alt="${escapeHtml(title)}"><span class="title">${escapeHtml(title)}</span>`;
         item.onclick = () => {
             searchResults.style.display = 'none';
             const existing = findExistingAnime(anime.id);
@@ -526,7 +665,7 @@ function renderSuggestions(animes) {
 function showStatusPicker() {
     const anime = currentSelectedAnime;
     UI.showModal('Definir Status', `
-        <p style="margin-bottom:15px;">Em qual categoria deseja adicionar <strong>${getBestTitle(anime.title, anime.synonyms)}</strong>?</p>
+        <p style="margin-bottom:15px;">Em qual categoria deseja adicionar <strong>${escapeHtml(getBestTitle(anime.title, anime.synonyms))}</strong>?</p>
         <div style="display:grid;gap:10px;">
             <button class="btn-modal btn-cancel status-opt" data-status="watching">🔵 Assistindo</button>
             <button class="btn-modal btn-cancel status-opt" data-status="completed">✅ Concluído</button>
@@ -580,14 +719,16 @@ async function finalizeAdd(status) {
     clearBtn.style.display = 'none';
     UI.hideModal();
     renderGrid(document.querySelector('.filter-btn.active').dataset.filter, '');
-    UI.showToast(`"${newAnime.title}" adicionado com sucesso!`, 'success');
+    UI.showToast(`"${escapeHtml(newAnime.title)}" adicionado com sucesso!`, 'success');
 }
 
 // ---------- GRID PRINCIPAL ----------
 
 function renderGrid(filter, query = '') {
-    focusedCardIndex = -1; // grid foi refeito, qualquer navegação anterior perde sentido
-    let list = myAnimeList.filter(a => a.status === filter);
+    focusedCardIndex = -1;
+    let list = query
+    ? [...myAnimeList]
+    : myAnimeList.filter(a => a.status === filter);
 
     if (query) {
         const q = query.toLowerCase();
@@ -604,24 +745,34 @@ function renderGrid(filter, query = '') {
     }
 
     const sortVal = sortSelect.value;
-    if (sortVal === 'alpha') {
-        list = [...list].sort((a, b) => a.title.localeCompare(b.title));
-    } else {
-        list = [...list].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    }
+if (sortVal === 'alpha') {
+    list = [...list].sort((a, b) => a.title.localeCompare(b.title));
+} else if (sortVal === 'year') {
+    list = [...list].sort((a, b) => (b.year || 0) - (a.year || 0));
+} else if (sortVal === 'progress') {
+    list = [...list].sort((a, b) => {
+        const progressA = a.total_ep ? (a.current_ep || 0) / a.total_ep : 0;
+        const progressB = b.total_ep ? (b.current_ep || 0) / b.total_ep : 0;
+        return progressB - progressA;
+    });
+} else {
+    list = [...list].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+}
 
-    animeGrid.innerHTML = '';
+if (sortReversed) list.reverse();
 
     if (list.length === 0) {
         animeGrid.innerHTML = `<p style="color:var(--text-dim);grid-column:1/-1;text-align:center;padding:40px 0;">Nenhum anime encontrado.</p>`;
         return;
     }
 
+    // Monta tudo fora do DOM real primeiro
+    const fragment = document.createDocumentFragment();
+
     list.forEach(anime => {
-        const badgeClass = anime.status === 'watching' ? 'badge-watching'
-            : anime.status === 'completed' ? 'badge-completed' : 'badge-planned';
-        const badgeLabel = anime.status === 'watching' ? 'Assistindo'
-            : anime.status === 'completed' ? 'Concluído' : 'Planejado';
+        const statusCfg = STATUS_CONFIG[anime.status];
+        const badgeClass = statusCfg.badgeClass;
+        const badgeLabel = statusCfg.label;
 
         let metaRight;
         if (anime.status === 'watching') {
@@ -632,34 +783,39 @@ function renderGrid(filter, query = '') {
             metaRight = `<span class="ep-planned">${anime.total_ep || '?'} Episódios</span>`;
         }
 
-                const nextEp = nextEpisodeCache[parseInt(anime.mal_id)];
+        const nextEp = nextEpisodeCache[parseInt(anime.mal_id)];
         const nextEpHTML = nextEp
-            ? `<div class="next-ep-info">🕐 Ep ${nextEp.episode} ${formatAiringCountdown(nextEp.airingAt)}</div>`
-            : '';
+    ? `<div class="next-ep-info" data-mal-id="${parseInt(anime.mal_id)}">🕐 Ep ${nextEp.episode} ${formatAiringCountdown(nextEp.airingAt)}</div>`
+    : '';
 
         const card = document.createElement('div');
         card.className = 'anime-card';
         card.innerHTML = `
-            <span class="status-badge ${badgeClass}">${badgeLabel}</span>
-            <button class="delete-btn" title="Remover">&times;</button>
-            <img src="${anime.cover_url || ''}" alt="${anime.title}" loading="lazy">
-            <div class="card-info">
-                <h3>${anime.title}</h3>
-                <div class="card-meta">
-                    <span class="meta-year">${anime.year || 'N/A'}</span>
-                    ${metaRight}
-                </div>
-                ${nextEpHTML}
-            </div>
-        `;
-        
+    <span class="status-badge ${badgeClass}">${badgeLabel}</span>
+    <button class="delete-btn" title="Remover">&times;</button>
+    <img src="${escapeHtml(anime.cover_url || '')}" alt="${escapeHtml(anime.title)}" loading="lazy">
+    <div class="card-info">
+        <h3>${escapeHtml(anime.title)}</h3>
+        <div class="card-meta">
+            <span class="meta-year">${escapeHtml(anime.year || 'N/A')}</span>
+            ${metaRight}
+        </div>
+        ${nextEpHTML}
+    </div>
+`;
+
         card.querySelector('.delete-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             deleteAnime(anime.id);
         });
         card.addEventListener('click', () => showDetail(anime.id));
-        animeGrid.appendChild(card);
+
+        fragment.appendChild(card); // vai pro fragment, não pro DOM ainda
     });
+
+    // Só agora troca o conteúdo real da página, de uma vez só
+    animeGrid.innerHTML = '';
+    animeGrid.appendChild(fragment);
 }
 
 // ---------- TELA DE DETALHES ----------
@@ -695,7 +851,7 @@ async function showDetail(id_db) {
                 }
             }
         `;
-        const data = await queryAniList(gqlQuery, { id: anilistId });
+        const data = await queryAniList(gqlQuery, { id: anilistId }, { priority: true });
         const m = data?.Media;
         if (!m) throw new Error('Anime não encontrado na AniList.');
 
@@ -726,16 +882,16 @@ async function showDetail(id_db) {
 }
 
 function renderDetail(anime) {
-    const synopsis = anime.synopsis || 'Sinopse não disponível.';
+    const synopsis = escapeHtml(anime.synopsis || 'Sinopse não disponível.');
     const episodesStr = anime.total_ep || '?';
     const totalEps = parseInt(episodesStr);
-    const year = anime.year || 'N/A';
-    const genres = anime.genres ? anime.genres.join(', ') : '';
-    const image = anime.cover_url;
+    const year = escapeHtml(anime.year || 'N/A');
+    const genres = anime.genres ? escapeHtml(anime.genres.join(', ')) : '';
+    const image = escapeHtml(anime.cover_url || '');
 
     animeDetail.innerHTML = `
         <div class="detail-header">
-            <img src="${image}" alt="${anime.title}">
+            <img src="${image}" alt="${escapeHtml(anime.title)}">
             <div class="detail-overlay">
             <div>
             <div class="main-title-row">
@@ -755,14 +911,17 @@ function renderDetail(anime) {
                     <button id="read-more-btn" class="read-more-btn">Ler mais</button>
                 </div>
                 <h4>Gestão de Status</h4>
+
                 <div class="status-selector">
                     <label>Status Atual:</label>
+
                     <select id="status-select">
-                        <option value="watching" ${anime.status === 'watching' ? 'selected' : ''}>🔵 Assistindo</option>
-                        <option value="completed" ${anime.status === 'completed' ? 'selected' : ''}>✅ Concluído</option>
-                        <option value="planned" ${anime.status === 'planned' ? 'selected' : ''}>⏳ Planejado</option>
+                        ${Object.entries(STATUS_CONFIG).map(([key, cfg]) =>
+                        `<option value="${key}" ${anime.status === key ? 'selected' : ''}>${cfg.emoji} ${cfg.label}</option>`
+                        ).join('')}
                     </select>
                 </div>
+
                 <h4>Informações</h4>
                 <div class="detail-stats">
                     <div class="stat-item"><span class="stat-label">Ano</span><span class="stat-value">${year}</span></div>
@@ -771,7 +930,7 @@ function renderDetail(anime) {
                     ${(() => {
                         const nextEp = nextEpisodeCache[parseInt(anime.mal_id)];
                         if (!nextEp) return '';
-                        return `<div class="stat-item"><span class="stat-label">Próximo Episódio</span><span class="stat-value">Ep ${nextEp.episode} • ${formatAiringCountdown(nextEp.airingAt)}</span></div>`;
+                        return `<div class="stat-item"><span class="stat-label">Próximo Episódio</span><span class="stat-value" id="detail-next-ep-value" data-mal-id="${parseInt(anime.mal_id)}">Ep ${nextEp.episode} • ${formatAiringCountdown(nextEp.airingAt)}</span></div>`;
                     })()}
                 </div>
                 <div class="progress-tracker" id="progress-tracker">
@@ -781,7 +940,6 @@ function renderDetail(anime) {
                     <button id="edit-ep-btn" class="btn-modal btn-cancel" style="font-size: 0.8rem; padding: 5px 15px;">✏️ Editar Episódio</button>
                 </div>
             </div>
-            <div class="detail-sidebar"></div>
         </div>
     `;
 
@@ -802,7 +960,7 @@ if (altTitlesContainer) {
         altTitlesContainer.innerHTML = `
             <div class="alt-title-item">
                 <span class="alt-title-label">Romaji:</span>
-                <span class="alt-title-text">${anime.title_romaji}</span>
+                <span class="alt-title-text">${escapeHtml(anime.title_romaji)}</span>
                 <button class="alt-title-btn copy-title-btn" id="copy-romaji-title" title="Copiar">📋</button>
             </div>
         `;
@@ -918,14 +1076,14 @@ if (altTitlesContainer) {
 async function deleteAnime(id_db) {
     const anime = myAnimeList.find(a => a.id === id_db);
     if (!anime) return;
-    UI.showModal('Remover Anime', `Tem certeza que deseja remover <strong>${anime.title}</strong>?`, [
+    UI.showModal('Remover Anime', `Tem certeza que deseja remover <strong>${escapeHtml(anime.title)}</strong>?`, [
         {
             text: 'Sim, remover', class: 'btn-confirm', action: async () => {
                 await removeAnime(id_db);
                 await loadList();
                 renderGrid(document.querySelector('.filter-btn.active').dataset.filter, searchInput.value.trim());
                 UI.hideModal();
-                UI.showToast(`"${anime.title}" removido da lista.`, 'info');
+                UI.showToast(`"${escapeHtml(anime.title)}" removido da lista.`, 'info');
             }
         },
         { text: 'Cancelar', class: 'btn-cancel', action: UI.hideModal }
@@ -1164,6 +1322,12 @@ sortSelect.addEventListener('change', () => {
     renderGrid(document.querySelector('.filter-btn.active').dataset.filter, searchInput.value.trim());
 });
 
+sortDirectionBtn.addEventListener('click', () => {
+    sortReversed = !sortReversed;
+    sortDirectionBtn.textContent = sortReversed ? '⬆️' : '⬇️';
+    renderGrid(document.querySelector('.filter-btn.active').dataset.filter, searchInput.value.trim());
+});
+
 genreSelect.addEventListener('change', () => {
     renderGrid(document.querySelector('.filter-btn.active').dataset.filter, searchInput.value.trim());
 });
@@ -1231,11 +1395,13 @@ document.addEventListener('keydown', (e) => {
         return;
     }
 
-    if (!inDetailView && ['1', '2', '3'].includes(e.key)) {
-        const map = { '1': 'watching', '2': 'completed', '3': 'planned' };
-        document.querySelector(`.filter-btn[data-filter="${map[e.key]}"]`)?.click();
+    if (!inDetailView) {
+    const statusEntry = Object.entries(STATUS_CONFIG).find(([, cfg]) => cfg.key === e.key);
+    if (statusEntry) {
+        document.querySelector(`.filter-btn[data-filter="${statusEntry[0]}"]`)?.click();
         return;
     }
+}
 
     if (!inDetailView) {
         const cards = getVisibleCards();
@@ -1322,11 +1488,18 @@ function updateGenreDropdown() {
 }
 
 async function initApp() {
+    loadNextEpisodeCache(); // recupera o cache salvo, mesmo antes de decidir se atualiza
     await loadList();
     renderGrid('watching');
-    refreshLiveAniListData().then(() => {
-        renderGrid(document.querySelector('.filter-btn.active').dataset.filter, searchInput.value.trim());
-    });
+    startCountdownTicker(); // liga o "relógio" do countdown, roda pra sempre a cada 1min
+
+    if (shouldRefreshLiveData()) {
+        refreshLiveAniListData().then(() => {
+            markLiveDataRefreshed();
+            saveNextEpisodeCache();
+            renderGrid(document.querySelector('.filter-btn.active').dataset.filter, searchInput.value.trim());
+        });
+    }
 }
 
 window.addEventListener('load', async () => {

@@ -298,6 +298,22 @@ header {
     border-color: var(--accent-color);
 }
 
+.sort-direction-btn {
+    background: var(--card-bg);
+    color: white;
+    border: 1px solid var(--border-color);
+    padding: 10px 14px;
+    border-radius: 12px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    transition: var(--transition);
+}
+
+.sort-direction-btn:hover {
+    border-color: var(--accent-color);
+    background: var(--accent-color);
+}
+
 .filter-btn {
     background: var(--card-bg);
     color: var(--text-dim);
