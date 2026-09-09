@@ -333,6 +333,65 @@ header {
     box-shadow: 0 5px 15px rgba(202, 62, 71, 0.3);
 }
 
+.upcoming-section {
+    margin-bottom: 50px;
+}
+
+.upcoming-title {
+    font-family: 'Kanit', sans-serif;
+    font-size: 1.3rem;
+    margin-bottom: 20px;
+    color: var(--text-main);
+}
+
+.upcoming-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 20px;
+}
+
+.upcoming-card {
+    background: var(--card-bg);
+    border-radius: 16px;
+    overflow: hidden;
+    border: 1px solid var(--glass);
+    cursor: pointer;
+    transition: var(--transition);
+    position: relative;
+}
+
+.upcoming-card:hover {
+    transform: translateY(-6px);
+    border-color: var(--accent-color);
+    box-shadow: 0 15px 30px rgba(0,0,0,0.5);
+}
+
+.upcoming-card img {
+    width: 100%;
+    height: 140px;
+    object-fit: cover;
+}
+
+.upcoming-info {
+    padding: 12px;
+}
+
+.upcoming-info h4 {
+    font-family: 'Kanit', sans-serif;
+    font-size: 0.85rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 6px;
+}
+
+.upcoming-progress {
+    display: block;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+}
+
 .anime-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -348,6 +407,30 @@ header {
     transition: var(--transition);
     position: relative;
     cursor: pointer;
+}
+
+.skeleton-card {
+    background: var(--card-bg);
+    border-radius: 20px;
+    overflow: hidden;
+    border: 1px solid var(--glass);
+    height: 320px;
+    position: relative;
+}
+
+.skeleton-card::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: -150%;
+    width: 150%;
+    height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.05), transparent);
+    animation: skeleton-shine 1.5s infinite;
+}
+
+@keyframes skeleton-shine {
+    100% { left: 150%; }
 }
 
 .anime-card:hover {
@@ -434,6 +517,11 @@ kbd {
     font-weight: 600;
 }
 
+.ep-dropped {
+    color: var(--text-dim);
+    font-weight: 600;
+}
+
 .status-badge {
     position: absolute;
     top: 15px;
@@ -451,6 +539,7 @@ kbd {
 .badge-watching { background: rgba(202, 62, 71, 0.8); }
 .badge-completed { background: rgba(34, 197, 94, 0.8); }
 .badge-planned { background: rgba(82, 82, 82, 0.8); }
+.badge-dropped { background: rgba(60, 50, 50, 0.85); }
 
 .delete-btn {
     position: absolute;
@@ -820,6 +909,64 @@ kbd {
     filter: brightness(1.2);
 }
 
+.suggestions-section {
+    margin-top: 40px;
+    padding-top: 30px;
+    border-top: 1px solid var(--glass);
+}
+
+.suggestions-section h4 {
+    font-family: 'Kanit', sans-serif;
+    color: var(--accent-color);
+    margin-bottom: 20px;
+    font-size: 1.3rem;
+}
+
+.suggestions-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 20px;
+}
+
+.suggestion-card {
+    background: var(--bg-color);
+    border-radius: 16px;
+    overflow: hidden;
+    border: 1px solid var(--glass);
+    cursor: pointer;
+    transition: var(--transition);
+}
+
+.suggestion-card:hover {
+    transform: translateY(-6px);
+    border-color: var(--accent-color);
+    box-shadow: 0 15px 30px rgba(0,0,0,0.5);
+}
+
+.suggestion-card img {
+    width: 100%;
+    height: 140px;
+    object-fit: cover;
+}
+
+.suggestion-info {
+    padding: 12px;
+}
+
+.suggestion-info h5 {
+    font-family: 'Kanit', sans-serif;
+    font-size: 0.85rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 4px;
+}
+
+.suggestion-info span {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+}
+
 .detail-stats {
     background: var(--bg-color);
     padding: 30px;
@@ -1048,5 +1195,35 @@ kbd {
         right: 20px;
         bottom: 20px;
         max-width: none;
+    }
+    .upcoming-grid {
+        grid-template-columns: none;
+        display: flex;
+        overflow-x: auto;
+        scroll-snap-type: x mandatory;
+        gap: 12px;
+        padding-bottom: 10px;
+    }
+    .upcoming-card {
+        flex: 0 0 130px;
+        scroll-snap-align: start;
+    }
+    .upcoming-card img {
+        height: 100px;
+    }
+    .suggestions-grid {
+        grid-template-columns: none;
+        display: flex;
+        overflow-x: auto;
+        scroll-snap-type: x mandatory;
+        gap: 12px;
+        padding-bottom: 10px;
+    }
+    .suggestion-card {
+        flex: 0 0 130px;
+        scroll-snap-align: start;
+    }
+    .suggestion-card img {
+        height: 100px;
     }
 }
