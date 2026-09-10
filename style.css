@@ -17,7 +17,6 @@
     box-sizing: border-box;
     margin: 0;
     padding: 0;
-    overflow-x: hidden;
 }
 
 body {
@@ -28,7 +27,7 @@ body {
     max-width: 1200px;
     margin: 0 auto;
     padding: 60px 20px;
- 
+    overflow-x: hidden;
 }
 
 header {
@@ -856,6 +855,12 @@ kbd {
     font-family: 'Kanit', sans-serif;
     transition: var(--transition);
     font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    white-space: nowrap;
+    line-height: 1;
 }
 
 .btn-back:hover {
@@ -1228,4 +1233,8 @@ kbd {
     .suggestion-card img {
         height: 100px;
     }
+    .btn-back {
+        padding: 10px;
+    }
+
 }

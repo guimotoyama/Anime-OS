@@ -1066,7 +1066,7 @@ function renderDetail(anime) {
         </div>
         <div class="alt-titles" id="alt-titles"></div>
     </div>
-    <button class="btn-back" id="back-btn">← Voltar</button>
+    <button class="btn-back" id="back-btn"><span>←</span> Voltar</button>
     </div>
         </div>
         <div class="detail-body">

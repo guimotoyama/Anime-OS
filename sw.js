@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'v3.1';
+const CACHE_VERSION = 'v3.2';
 const CACHE_NAME = `anime-os-cache-${CACHE_VERSION}`;
 const ASSETS = [
   './',
