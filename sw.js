@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'v3';
+const CACHE_VERSION = 'v3.1';
 const CACHE_NAME = `anime-os-cache-${CACHE_VERSION}`;
 const ASSETS = [
   './',
@@ -11,8 +11,15 @@ const ASSETS = [
 self.addEventListener('install', (event) => {
   self.skipWaiting();
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => {
-      return cache.addAll(ASSETS);
+    caches.open(CACHE_NAME).then(async (cache) => {
+      // { cache: 'reload' } força ignorar qualquer cópia guardada no navegador,
+      // garantindo que pegamos os arquivos realmente atualizados do servidor.
+      await Promise.all(
+        ASSETS.map(async (url) => {
+          const response = await fetch(url, { cache: 'reload' });
+          return cache.put(url, response);
+        })
+      );
     })
   );
 });
@@ -38,9 +45,13 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  if (event.request.mode === 'navigate' || event.request.url.endsWith('.js')) {
+  if (
+    event.request.mode === 'navigate' ||
+    event.request.url.endsWith('.js') ||
+    event.request.url.endsWith('.css')
+  ) {
     event.respondWith(
-      fetch(event.request)
+      fetch(event.request, { cache: 'reload' })
         .then((response) => {
           const cloned = response.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put(event.request, cloned));

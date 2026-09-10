@@ -439,9 +439,17 @@ async function loadList() {
         .from('animes')
         .select('*')
         .order('created_at', { ascending: false });
-    if (error) { console.error('Erro ao carregar lista:', error); return; }
+
+    if (error) {
+        console.error('Erro ao carregar lista:', error);
+        showLoadErrorState();
+        UI.showToast('Não foi possível carregar sua lista. Verifique sua conexão.', 'error');
+        return { success: false };
+    }
+
     myAnimeList = data;
     updateGenreDropdown();
+    return { success: true };
 }
 
 async function addAnimeToDB(anime) {
@@ -898,6 +906,18 @@ function renderGridSkeleton(count = 8) {
         fragment.appendChild(card);
     }
     animeGrid.appendChild(fragment);
+}
+
+function showLoadErrorState() {
+    animeGrid.innerHTML = `
+        <div style="grid-column:1/-1;text-align:center;padding:60px 20px;">
+            <p style="color:var(--text-dim);margin-bottom:20px;">
+                ⚠️ Não foi possível carregar sua lista. Verifique sua conexão com a internet.
+            </p>
+            <button id="retry-load-btn" class="btn-modal btn-confirm">Tentar novamente</button>
+        </div>
+    `;
+    document.getElementById('retry-load-btn').onclick = () => initApp();
 }
 
 // ---------- TELA DE DETALHES ----------
@@ -1658,7 +1678,9 @@ function updateGenreDropdown() {
 async function initApp() {
     renderGridSkeleton();
     loadNextEpisodeCache(); // recupera o cache salvo, mesmo antes de decidir se atualiza
-    await loadList();
+    const result = await loadList();
+    if (!result.success) return; // já mostrou o erro dentro de loadList, não continua
+
     renderGrid('watching');
     startCountdownTicker(); // liga o "relógio" do countdown, roda pra sempre a cada 1min
 

@@ -17,6 +17,7 @@
     box-sizing: border-box;
     margin: 0;
     padding: 0;
+    overflow-x: hidden;
 }
 
 body {
@@ -1144,19 +1145,20 @@ kbd {
     }
 
     .filter-group, .sort-category-group {
-        flex-wrap: nowrap;
-        gap: 8px;
+        gap: 6px;
     }
     .filter-btn {
-        font-size: 0.8rem;
+        font-size: 0.7rem;
+        padding: 8px;
     }
     .premium-select {
-        font-size: 0.8rem;
+        font-size: 0.7rem;
+        text-align: center;
+        padding: 10px;
     }
     .anime-grid {
         grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
         gap: 15px;
-        padding: 0 15px;
     }
     .anime-card img {
         height: 180px;
