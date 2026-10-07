@@ -562,6 +562,24 @@ function loadNextEpisodeCache() {
     }
 }
 
+function cleanupNextEpisodeCache() {
+    const validIds = new Set(
+        myAnimeList
+            .filter(a => a.status !== 'completed' && a.status !== 'dropped')
+            .map(a => parseInt(a.anime_id))
+    );
+
+    let changed = false;
+    for (const idStr of Object.keys(nextEpisodeCache)) {
+        if (!validIds.has(parseInt(idStr))) {
+            delete nextEpisodeCache[idStr];
+            changed = true;
+        }
+    }
+
+    if (changed) saveNextEpisodeCache();
+}
+
 const LIVE_REFRESH_KEY = 'anime_os_last_refresh';
 const LIVE_REFRESH_INTERVAL = 2 * 60 * 60 * 1000; // 2 horas — ajuste aqui se quiser mais
 const SUGGESTION_KEY = 'anime_os_suggestions';
@@ -762,6 +780,7 @@ function renderUpcoming() {
     const upcomingGrid = document.getElementById('upcoming-grid');
 
     const withNextEp = myAnimeList
+        .filter(anime => anime.status !== 'completed' && anime.status !== 'dropped')
         .map(anime => ({ anime, nextEp: nextEpisodeCache[parseInt(anime.anime_id)] }))
         .filter(item => item.nextEp);
 
@@ -1062,7 +1081,7 @@ function renderDetail(anime) {
             <div>
             <div class="main-title-row">
                 <h2>${anime.title}</h2>
-            <button class="alt-title-btn copy-title-btn" id="copy-main-title" title="Copiar título">📋</button>
+            <button class="alt-title-btn" id="copy-main-title" title="Copiar título">📋</button>
         </div>
         <div class="alt-titles" id="alt-titles"></div>
     </div>
@@ -1133,7 +1152,7 @@ if (altTitlesContainer) {
             <div class="alt-title-item">
                 <span class="alt-title-label">Romaji:</span>
                 <span class="alt-title-text">${escapeHtml(anime.title_romaji)}</span>
-                <button class="alt-title-btn copy-title-btn" id="copy-romaji-title" title="Copiar">📋</button>
+                <button class="alt-title-btn" id="copy-romaji-title" title="Copiar">📋</button>
             </div>
         `;
         document.getElementById('copy-romaji-title').onclick = (e) => {
@@ -1681,6 +1700,7 @@ async function initApp() {
     const result = await loadList();
     if (!result.success) return; // já mostrou o erro dentro de loadList, não continua
 
+    cleanupNextEpisodeCache(); // remove entradas órfãs (animes concluídos/abandonados/removidos)
     renderGrid('watching');
     startCountdownTicker(); // liga o "relógio" do countdown, roda pra sempre a cada 1min
 
